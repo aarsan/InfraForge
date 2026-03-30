@@ -1,0 +1,46 @@
+# InfraForge output files
+output/
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Copilot CLI
+.copilot/
+
+# Runtime database (not used — app uses Azure SQL)
+*.db
+!requirements*.db
+
+# Server logs
+server.log
+server_err.log
+server_stdout.log
+server_stderr.log
+_check_run.py
+server_debug.log
