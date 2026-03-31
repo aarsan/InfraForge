@@ -7472,6 +7472,146 @@ tr[class*="ns-group-"] > td:first-child {
 }
 
 /* ── Action Card ─────────────────────────────────────────── */
+/* ── Stage Section Headers ────────────────────────────────── */
+
+.uf-stage-header {
+    width: 620px;
+    max-width: 95%;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.55rem 1rem;
+    border-radius: 8px;
+    border-left: 3px solid var(--accent-blue);
+    background: rgba(59,130,246,0.04);
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.3s, background 0.3s;
+    margin-top: 0.25rem;
+}
+.uf-stage-header:hover { background: rgba(59,130,246,0.07); }
+.uf-stage-icon { font-size: 1.05rem; flex-shrink: 0; }
+.uf-stage-name {
+    font-weight: 700;
+    font-size: 0.82rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    flex: 1;
+}
+.uf-stage-badge {
+    font-size: 0.68rem; font-weight: 600;
+    padding: 0.12rem 0.45rem; border-radius: 4px;
+    display: flex; align-items: center; gap: 0.2rem;
+    flex-shrink: 0;
+}
+
+/* Stage states */
+.uf-stage-active { border-color: var(--accent-blue); }
+.uf-stage-active .uf-stage-name { color: var(--accent-blue); }
+.uf-stage-done { border-color: #3fb950; background: rgba(63,185,80,0.04); }
+.uf-stage-done .uf-stage-name { color: #3fb950; }
+.uf-stage-failed { border-color: #f85149; background: rgba(248,81,73,0.04); }
+.uf-stage-failed .uf-stage-name { color: #f85149; }
+
+/* Stage accent colors */
+.uf-stage-blue    { border-left-color: var(--accent-blue); }
+.uf-stage-purple  { border-left-color: #a371f7; }
+.uf-stage-amber   { border-left-color: #d29922; }
+.uf-stage-teal    { border-left-color: #2dd4bf; }
+.uf-stage-green   { border-left-color: #3fb950; }
+.uf-stage-red     { border-left-color: #f85149; }
+
+.uf-stage-purple.uf-stage-active { border-left-color: #a371f7; }
+.uf-stage-purple.uf-stage-active .uf-stage-name { color: #a371f7; }
+.uf-stage-amber.uf-stage-active  { border-left-color: #d29922; }
+.uf-stage-amber.uf-stage-active .uf-stage-name  { color: #d29922; }
+.uf-stage-teal.uf-stage-active   { border-left-color: #2dd4bf; }
+.uf-stage-teal.uf-stage-active .uf-stage-name   { color: #2dd4bf; }
+.uf-stage-green.uf-stage-active  { border-left-color: #3fb950; }
+.uf-stage-green.uf-stage-active .uf-stage-name  { color: #3fb950; }
+
+/* Stage body — groups cards within a stage */
+.uf-stage-body {
+    padding-left: 0.25rem;
+    border-left: 1px solid var(--border-subtle);
+    margin-left: 0.75rem;
+}
+.uf-stage-body.uf-stage-body-collapsed { display: none; }
+
+/* Stage connector (vertical line between stages) */
+.uf-stage-connector {
+    width: 620px;
+    max-width: 95%;
+    display: flex;
+    justify-content: flex-start;
+    padding-left: 1.1rem;
+    height: 20px;
+}
+.uf-stage-connector-line {
+    width: 1px;
+    height: 100%;
+    background: var(--border-subtle);
+}
+
+/* ── Pipeline Blueprint (static preview of a definition) ──── */
+
+.pipeline-blueprint {
+    width: 620px;
+    max-width: 95%;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    padding: 1rem;
+}
+.blueprint-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+.blueprint-icon { font-size: 1.3rem; }
+.blueprint-title { font-weight: 700; font-size: 1rem; }
+.blueprint-version {
+    font-size: 0.72rem; font-weight: 600;
+    padding: 0.1rem 0.35rem; border-radius: 4px;
+    background: rgba(59,130,246,0.1); color: var(--accent-blue);
+}
+.blueprint-desc { font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 0.75rem; }
+.blueprint-stage {
+    margin-bottom: 0.5rem;
+    border-left: 3px solid var(--border-subtle);
+    padding-left: 0.75rem;
+}
+.blueprint-stage-header {
+    display: flex; align-items: center; gap: 0.4rem;
+    font-weight: 600; font-size: 0.8rem;
+    text-transform: uppercase; letter-spacing: 0.03em;
+    color: var(--text-secondary);
+    margin-bottom: 0.3rem;
+}
+.blueprint-step {
+    display: flex; align-items: center; gap: 0.35rem;
+    font-size: 0.82rem;
+    padding: 0.2rem 0;
+    color: var(--text-primary);
+}
+.blueprint-step-icon { font-size: 0.85rem; width: 1.3rem; text-align: center; }
+.blueprint-step-name { flex: 1; }
+.blueprint-step-heal {
+    font-size: 0.65rem;
+    color: var(--accent-blue);
+    padding: 0.05rem 0.3rem; border-radius: 3px;
+    background: rgba(59,130,246,0.08);
+}
+
+/* Stage color accents in blueprint */
+.blueprint-stage-blue   { border-left-color: var(--accent-blue); }
+.blueprint-stage-purple { border-left-color: #a371f7; }
+.blueprint-stage-amber  { border-left-color: #d29922; }
+.blueprint-stage-teal   { border-left-color: #2dd4bf; }
+.blueprint-stage-green  { border-left-color: #3fb950; }
+
 .uf-action {
     width: 620px;
     max-width: 95%;

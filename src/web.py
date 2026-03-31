@@ -856,12 +856,14 @@ from src.routers.deployment import router as deployment_router
 from src.routers.ws import router as ws_router
 from src.routers.org import router as org_router
 from src.routers.processes import router as processes_router
+from src.routers.pipelines import router as pipelines_router
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(deployment_router)
 app.include_router(ws_router)
 app.include_router(org_router)
 app.include_router(processes_router)
+app.include_router(pipelines_router)
 
 # Serve static files (HTML, CSS, JS)
 static_dir = os.path.join(os.path.dirname(__file__), "..", "static")

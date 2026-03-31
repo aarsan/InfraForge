@@ -1211,6 +1211,24 @@ AZURE_SQL_SCHEMA_STATEMENTS = [
     )""",
     """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_org_process_steps_process')
     CREATE INDEX idx_org_process_steps_process ON org_process_steps(process_id, step_order)""",
+    # ══════════════════════════════════════════════════════════
+    # PIPELINE DEFINITIONS — Machine-readable pipeline schemas
+    # produced by AI agents and consumed by the PipelineRunner.
+    # ══════════════════════════════════════════════════════════
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'pipeline_definitions')
+    CREATE TABLE pipeline_definitions (
+        id              NVARCHAR(100)  PRIMARY KEY,
+        name            NVARCHAR(200)  NOT NULL,
+        version         NVARCHAR(20)   NOT NULL DEFAULT '1.0.0',
+        definition_json NVARCHAR(MAX)  NOT NULL,
+        created_at      DATETIME2      DEFAULT GETUTCDATE(),
+        updated_at      DATETIME2      DEFAULT GETUTCDATE(),
+        created_by      NVARCHAR(100)  DEFAULT NULL,
+        is_builtin      BIT            DEFAULT 0,
+        enabled         BIT            DEFAULT 1
+    )
+    """,
 ]
 
 
@@ -3809,6 +3827,10 @@ async def seed_governance_data() -> dict:
     proc_count = await seed_orchestration_processes()
     summary["orchestration_processes"] = proc_count
 
+    # ── Seed pipeline definitions ──
+    pipeline_count = await seed_pipeline_definitions()
+    summary["pipeline_definitions"] = pipeline_count
+
     # ── Seed agent definitions ──
     agent_count = await seed_agent_definitions()
     summary["agent_definitions"] = agent_count
@@ -5630,6 +5652,110 @@ async def refresh_orchestration_processes() -> int:
 
     # Re-seed with current definitions
     return await seed_orchestration_processes()
+
+
+# ══════════════════════════════════════════════════════════════
+# PIPELINE DEFINITIONS — standardised machine-readable schemas
+# ══════════════════════════════════════════════════════════════
+
+async def save_pipeline_definition(
+    definition_id: str,
+    name: str,
+    version: str,
+    definition_json: str,
+    *,
+    created_by: str | None = None,
+    is_builtin: bool = False,
+) -> None:
+    """Upsert a pipeline definition (MERGE pattern for SQL Server)."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """
+        MERGE pipeline_definitions AS tgt
+        USING (SELECT ? AS id) AS src ON tgt.id = src.id
+        WHEN MATCHED THEN
+            UPDATE SET name = ?, version = ?, definition_json = ?,
+                       updated_at = ?, created_by = COALESCE(?, tgt.created_by),
+                       is_builtin = ?
+        WHEN NOT MATCHED THEN
+            INSERT (id, name, version, definition_json, created_at, updated_at,
+                    created_by, is_builtin, enabled)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1);
+        """,
+        (
+            definition_id,
+            # UPDATE params
+            name, version, definition_json, now, created_by, int(is_builtin),
+            # INSERT params
+            definition_id, name, version, definition_json, now, now,
+            created_by, int(is_builtin),
+        ),
+    )
+
+
+async def get_pipeline_definition(definition_id: str) -> dict | None:
+    """Fetch a single pipeline definition by ID."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM pipeline_definitions WHERE id = ?",
+        (definition_id,),
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    # Parse the embedded JSON
+    try:
+        row["definition"] = json.loads(row.get("definition_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        row["definition"] = {}
+    return row
+
+
+async def list_pipeline_definitions(*, enabled_only: bool = True) -> list[dict]:
+    """List all pipeline definitions (lightweight — no definition_json body)."""
+    backend = await get_backend()
+    where = "WHERE enabled = 1" if enabled_only else ""
+    rows = await backend.execute(
+        f"SELECT id, name, version, created_at, updated_at, "
+        f"created_by, is_builtin, enabled FROM pipeline_definitions {where} "
+        f"ORDER BY is_builtin DESC, name",
+        (),
+    )
+    return [dict(r) for r in rows]
+
+
+async def delete_pipeline_definition(definition_id: str) -> bool:
+    """Delete a pipeline definition. Returns True if a row was removed."""
+    backend = await get_backend()
+    affected = await backend.execute_write(
+        "DELETE FROM pipeline_definitions WHERE id = ? AND is_builtin = 0",
+        (definition_id,),
+    )
+    return affected > 0
+
+
+async def seed_pipeline_definitions() -> int:
+    """Seed built-in pipeline definitions from pipeline_schema.py.
+
+    Uses upsert so code-side updates propagate on restart, but
+    user-created definitions (is_builtin=0) are never touched.
+    """
+    from src.pipeline_schema import get_builtin_definitions
+
+    count = 0
+    for defn in get_builtin_definitions():
+        await save_pipeline_definition(
+            definition_id=defn.id,
+            name=defn.name,
+            version=defn.version,
+            definition_json=defn.model_dump_json(),
+            created_by="infraforge",
+            is_builtin=True,
+        )
+        count += 1
+    logger.info(f"Seeded {count} built-in pipeline definitions")
+    return count
 
 
 # ══════════════════════════════════════════════════════════════
