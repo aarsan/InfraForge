@@ -1,0 +1,152 @@
+"""
+InfraForge custom tools for the Copilot SDK agent.
+"""
+
+from src.tools.catalog_search import search_template_catalog
+from src.tools.catalog_compose import compose_from_catalog
+from src.tools.catalog_register import register_template
+from src.tools.catalog_clone import clone_template
+from src.tools.bicep_generator import generate_bicep
+from src.tools.terraform_generator import generate_terraform
+from src.tools.github_actions_generator import generate_github_actions_pipeline
+from src.tools.azure_devops_generator import generate_azure_devops_pipeline
+from src.tools.diagram_generator import generate_architecture_diagram
+from src.tools.design_document import generate_design_document
+from src.tools.cost_estimator import estimate_azure_cost
+from src.tools.policy_checker import check_policy_compliance
+from src.tools.save_output import save_output_to_file
+from src.tools.github_publisher import publish_to_github
+from src.tools.service_catalog import (
+    check_service_approval,
+    request_service_approval,
+    list_approved_services,
+    get_approval_request_status,
+    review_approval_request,
+)
+from src.tools.governance_tools import (
+    list_security_standards,
+    list_compliance_frameworks,
+    list_governance_policies,
+    request_policy_modification,
+)
+from src.tools.deploy_engine import (
+    validate_deployment,
+    deploy_infrastructure,
+    get_deployment_status,
+    teardown_deployment,
+)
+from src.tools.service_details import get_service_details
+from src.tools.template_browser import browse_template_catalog
+from src.tools.deployment_history import list_deployments
+from src.tools.platform_overview import get_platform_overview
+from src.tools.workiq_tools import (
+    search_org_knowledge,
+    find_related_documents,
+    find_subject_matter_experts,
+)
+
+
+def get_all_tools() -> list:
+    """Return all custom tools for the InfraForge agent.
+
+    Tools are ordered to mirror the enterprise infrastructure lifecycle:
+    1. Service governance — check which Azure services are approved
+    2. Standards & compliance — security standards, compliance frameworks, org policies
+    3. Catalog tools (search → compose → register) — always try reuse first
+    4. Generation tools — fallback when catalog has no match
+    5. Architecture visualization — diagram + design document
+    6. Validation tools — cost estimation and policy checks
+    7. Output tools — save results
+    """
+    return [
+        # Service governance (check before everything)
+        check_service_approval,
+        request_service_approval,
+        list_approved_services,
+        get_service_details,
+        get_approval_request_status,
+        review_approval_request,
+        # Standards & compliance
+        list_security_standards,
+        list_compliance_frameworks,
+        list_governance_policies,
+        request_policy_modification,
+        # Catalog-first workflow
+        search_template_catalog,
+        browse_template_catalog,
+        compose_from_catalog,
+        register_template,
+        clone_template,
+        # Generation (fallback)
+        generate_bicep,
+        generate_terraform,
+        generate_github_actions_pipeline,
+        generate_azure_devops_pipeline,
+        # Architecture visualization
+        generate_architecture_diagram,
+        generate_design_document,
+        # Validation
+        estimate_azure_cost,
+        check_policy_compliance,
+        # Deployment (ARM SDK — machine-native, no CLI deps)
+        validate_deployment,
+        deploy_infrastructure,
+        get_deployment_status,
+        list_deployments,
+        teardown_deployment,
+        # Platform analytics
+        get_platform_overview,
+        # Microsoft Work IQ (M365 organizational intelligence)
+        search_org_knowledge,
+        find_related_documents,
+        find_subject_matter_experts,
+        # Output
+        save_output_to_file,
+        # Publishing
+        publish_to_github,
+    ]
+
+
+def get_governance_tools() -> list:
+    """Return governance-specific tools for the Governance Advisor agent.
+
+    A focused subset of tools for policy/standards discussion and
+    policy modification requests. Does NOT include generation, deployment,
+    or catalog tools — the governance agent is for governance conversations only.
+    """
+    return [
+        list_security_standards,
+        list_compliance_frameworks,
+        list_governance_policies,
+        request_policy_modification,
+    ]
+
+
+def get_concierge_tools() -> list:
+    """Return tools for the Concierge / CISO Advisor agent.
+
+    Combines governance read tools with CISO write tools (policy modification,
+    exception management, toggling) plus service catalog lookup. This gives the
+    concierge full authority to investigate AND act on policy concerns.
+    """
+    from src.tools.ciso_tools import (
+        modify_governance_policy,
+        toggle_policy,
+        grant_policy_exception,
+        list_policy_exceptions,
+    )
+
+    return [
+        # Read — governance awareness
+        list_security_standards,
+        list_compliance_frameworks,
+        list_governance_policies,
+        # Read — service catalog awareness
+        check_service_approval,
+        list_approved_services,
+        # Write — CISO authority
+        modify_governance_policy,
+        toggle_policy,
+        grant_policy_exception,
+        list_policy_exceptions,
+    ]

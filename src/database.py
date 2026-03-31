@@ -1,0 +1,5971 @@
+"""
+InfraForge — Database Layer (Azure SQL Database)
+
+All persistent data lives in Azure SQL Database with Azure AD authentication
+via DefaultAzureCredential (managed identity in Azure, Azure CLI locally).
+
+Requires AZURE_SQL_CONNECTION_STRING to be set in the environment.
+
+Tables:
+  user_sessions            — Auth sessions (persists across server restarts)
+  chat_messages            — Conversation history
+  usage_logs               — Usage analytics
+  approval_requests        — Service approval requests with lifecycle tracking
+  projects                 — Infrastructure project proposals and phase tracking
+  security_standards       — Machine-readable security rules (HTTPS, TLS, managed identity...)
+  compliance_frameworks    — Compliance framework definitions (SOC2, HIPAA, CIS...)
+  compliance_controls      — Individual controls within frameworks
+  services                 — Approved Azure services catalog (with active_version)
+  service_versions         — Versioned ARM templates per service (v1, v2, v3...)
+  service_policies         — Per-service policy requirements (legacy)
+  service_approved_skus    — Approved SKUs per service
+  service_approved_regions — Approved regions per service
+  governance_policies      — Organization-wide governance rules (source of truth for validation)
+  compliance_assessments   — Results of compliance checks against approval requests
+"""
+
+import json
+import logging
+import os
+import time
+import asyncio
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from typing import Optional
+
+logger = logging.getLogger("infraforge.database")
+
+
+# ══════════════════════════════════════════════════════════════
+# ABSTRACT BACKEND INTERFACE
+# ══════════════════════════════════════════════════════════════
+
+class DatabaseBackend(ABC):
+    """Abstract database backend."""
+
+    @abstractmethod
+    async def init(self) -> None:
+        """Initialize the database (create tables if needed)."""
+        ...
+
+    @abstractmethod
+    async def execute(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Execute a query and return rows as dicts."""
+        ...
+
+    @abstractmethod
+    async def execute_write(self, sql: str, params: tuple = ()) -> int:
+        """Execute an INSERT/UPDATE/DELETE. Returns rowcount."""
+        ...
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Close connections / cleanup."""
+        ...
+
+
+# ══════════════════════════════════════════════════════════════
+# AZURE SQL DATABASE BACKEND
+# ══════════════════════════════════════════════════════════════
+
+class AzureSQLBackend(DatabaseBackend):
+    """Azure SQL Database backend.
+
+    Connects using Azure AD authentication (DefaultAzureCredential),
+    which automatically picks up:
+    - Managed identity (in Azure)
+    - Azure CLI credentials (local dev)
+    - Environment variables (CI/CD)
+    """
+
+    def __init__(self, connection_string: str):
+        self.connection_string = connection_string
+        self._credential = None
+        self._token = None
+
+    def _get_token_struct(self):
+        """Get (or refresh) an Azure AD token, encoded for pyodbc."""
+        import struct
+        import time
+        from azure.identity import DefaultAzureCredential
+
+        # Lazily create the credential (reused across calls)
+        if self._credential is None:
+            # Exclude credential types that don't apply and slow down auth
+            self._credential = DefaultAzureCredential(
+                exclude_workload_identity_credential=True,
+                exclude_managed_identity_credential=True,
+                exclude_developer_cli_credential=True,
+                exclude_powershell_credential=True,
+                exclude_visual_studio_code_credential=True,
+                exclude_interactive_browser_credential=True,
+            )
+
+        # Refresh token if expired or not yet fetched (5-min buffer)
+        if self._token is None or self._token.expires_on < time.time() + 300:
+            self._token = self._credential.get_token(
+                "https://database.windows.net/.default"
+            )
+
+        token_bytes = self._token.token.encode("utf-16-le")
+        return struct.pack(
+            f"<I{len(token_bytes)}s", len(token_bytes), token_bytes
+        )
+
+    async def init(self) -> None:
+        import pyodbc
+
+        from src.config import SQL_FIREWALL_CONNECT_RETRIES
+        from src.sql_firewall import (
+            ensure_sql_firewall,
+            extract_blocked_ip,
+            get_firewall_retry_delay,
+            is_sql_firewall_block_error,
+        )
+
+        conn = None
+        max_attempts = max(1, SQL_FIREWALL_CONNECT_RETRIES + 1)
+
+        for attempt_index in range(max_attempts):
+            token_struct = self._get_token_struct()
+            try:
+                conn = pyodbc.connect(
+                    self.connection_string,
+                    attrs_before={1256: token_struct},  # SQL_COPT_SS_ACCESS_TOKEN
+                )
+                break
+            except pyodbc.Error as exc:
+                err_msg = str(exc)
+                if not is_sql_firewall_block_error(err_msg):
+                    raise
+
+                blocked_ip = extract_blocked_ip(err_msg)
+                logger.warning(
+                    "SQL connection blocked by firewall (IP: %s) on attempt %d/%d — attempting auto-fix",
+                    blocked_ip or "unknown",
+                    attempt_index + 1,
+                    max_attempts,
+                )
+                remediation = await ensure_sql_firewall(blocked_ip=blocked_ip)
+                if not remediation.success:
+                    logger.warning(
+                        "SQL firewall remediation did not complete: %s (%s)",
+                        remediation.reason,
+                        remediation.message or "no details",
+                    )
+                if attempt_index >= max_attempts - 1:
+                    raise RuntimeError(
+                        f"Azure SQL firewall blocked the connection after {max_attempts} attempts. "
+                        f"Last remediation result: {remediation.reason}. {remediation.message}".strip()
+                    ) from exc
+
+                await asyncio.sleep(get_firewall_retry_delay(attempt_index))
+
+        if conn is None:
+            raise RuntimeError("Azure SQL connection could not be established after firewall remediation")
+
+        try:
+            cursor = conn.cursor()
+            # Create tables if they don't exist (T-SQL syntax)
+            for statement in AZURE_SQL_SCHEMA_STATEMENTS:
+                try:
+                    cursor.execute(statement)
+                except pyodbc.ProgrammingError:
+                    pass  # Table already exists
+            conn.commit()
+            logger.info("Azure SQL Database initialized")
+        finally:
+            conn.close()
+
+    def _get_connection(self):
+        """Get a SQL connection with cached Azure AD token auth.
+
+        Uses a connection pool to avoid re-establishing connections on
+        every query. pyodbc connections to Azure SQL take 500ms-2s each
+        due to TCP + TLS + AAD handshake, so reuse is critical.
+        """
+        import pyodbc
+        import threading
+
+        if not hasattr(self, '_pool'):
+            self._pool = []
+            self._pool_lock = threading.Lock()
+            self._pool_max = 4
+
+        # Try to reuse a pooled connection
+        with self._pool_lock:
+            while self._pool:
+                conn = self._pool.pop()
+                try:
+                    # Quick liveness check
+                    conn.cursor().execute("SELECT 1")
+                    return conn
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        # No pooled connections available — create a new one
+        token_struct = self._get_token_struct()
+        return pyodbc.connect(
+            self.connection_string,
+            attrs_before={1256: token_struct},
+        )
+
+    def _return_connection(self, conn):
+        """Return a connection to the pool instead of closing it."""
+        import threading
+
+        if not hasattr(self, '_pool_lock'):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+
+        with self._pool_lock:
+            if len(self._pool) < self._pool_max:
+                self._pool.append(conn)
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    async def execute(self, sql: str, params: tuple = ()) -> list[dict]:
+        import asyncio
+
+        def _run():
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(sql, params)
+                if cursor.description:
+                    columns = [col[0] for col in cursor.description]
+                    result = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                else:
+                    result = []
+            except Exception:
+                # Connection may be broken — don't return it to pool
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise
+            self._return_connection(conn)
+            return result
+
+        return await asyncio.get_event_loop().run_in_executor(None, _run)
+
+    async def execute_write(self, sql: str, params: tuple = ()) -> int:
+        import asyncio
+
+        def _run():
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(sql, params)
+                conn.commit()
+                rowcount = cursor.rowcount
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise
+            self._return_connection(conn)
+            return rowcount
+
+        return await asyncio.get_event_loop().run_in_executor(None, _run)
+
+    async def close(self) -> None:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════
+# SCHEMA DEFINITION (Azure SQL — T-SQL)
+# ══════════════════════════════════════════════════════════════
+
+# Azure SQL schema (T-SQL — individual statements)
+AZURE_SQL_SCHEMA_STATEMENTS = [
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'user_sessions')
+    CREATE TABLE user_sessions (
+        session_token   NVARCHAR(200) PRIMARY KEY,
+        user_id         NVARCHAR(200) NOT NULL,
+        display_name    NVARCHAR(200) NOT NULL,
+        email           NVARCHAR(200) NOT NULL,
+        job_title       NVARCHAR(200) DEFAULT '',
+        department      NVARCHAR(200) DEFAULT '',
+        cost_center     NVARCHAR(100) DEFAULT '',
+        manager         NVARCHAR(200) DEFAULT '',
+        groups_json     NVARCHAR(MAX) DEFAULT '[]',
+        roles_json      NVARCHAR(MAX) DEFAULT '[]',
+        team            NVARCHAR(200) DEFAULT '',
+        is_platform_team BIT DEFAULT 0,
+        is_admin        BIT DEFAULT 0,
+        access_token    NVARCHAR(MAX) DEFAULT '',
+        claims_json     NVARCHAR(MAX) DEFAULT '{}',
+        created_at      FLOAT NOT NULL,
+        expires_at      FLOAT NOT NULL
+    )
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'chat_messages')
+    CREATE TABLE chat_messages (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        session_token   NVARCHAR(200) NOT NULL,
+        role            NVARCHAR(20) NOT NULL,
+        content         NVARCHAR(MAX) NOT NULL,
+        created_at      FLOAT NOT NULL,
+        FOREIGN KEY (session_token) REFERENCES user_sessions(session_token) ON DELETE CASCADE
+    )
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'usage_logs')
+    CREATE TABLE usage_logs (
+        id                  INT IDENTITY(1,1) PRIMARY KEY,
+        timestamp           FLOAT NOT NULL,
+        user_email          NVARCHAR(200) NOT NULL,
+        department          NVARCHAR(200) DEFAULT '',
+        cost_center         NVARCHAR(100) DEFAULT '',
+        prompt              NVARCHAR(MAX) DEFAULT '',
+        resource_types_json NVARCHAR(MAX) DEFAULT '[]',
+        estimated_cost      FLOAT DEFAULT 0.0,
+        from_catalog        BIT DEFAULT 0
+    )
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'approval_requests')
+    CREATE TABLE approval_requests (
+        id                      NVARCHAR(100) PRIMARY KEY,
+        service_name            NVARCHAR(200) NOT NULL,
+        service_resource_type   NVARCHAR(200) DEFAULT 'unknown',
+        current_status          NVARCHAR(100) DEFAULT 'not_in_catalog',
+        risk_tier               NVARCHAR(50) DEFAULT 'medium',
+        business_justification  NVARCHAR(MAX) NOT NULL,
+        project_name            NVARCHAR(200) NOT NULL,
+        environment             NVARCHAR(50) DEFAULT 'production',
+        requestor_name          NVARCHAR(200) DEFAULT '',
+        requestor_email         NVARCHAR(200) DEFAULT '',
+        status                  NVARCHAR(50) DEFAULT 'submitted',
+        submitted_at            NVARCHAR(50) NOT NULL,
+        reviewed_at             NVARCHAR(50),
+        reviewer                NVARCHAR(200),
+        review_notes            NVARCHAR(MAX),
+        compliance_assessment_id NVARCHAR(100),
+        security_score          FLOAT,
+        compliance_results_json NVARCHAR(MAX) DEFAULT '{}'
+    )
+    """,
+    # ── Governance: Security Standards ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'security_standards')
+    CREATE TABLE security_standards (
+        id              NVARCHAR(100) PRIMARY KEY,
+        name            NVARCHAR(200) NOT NULL,
+        description     NVARCHAR(MAX) DEFAULT '',
+        category        NVARCHAR(100) NOT NULL,
+        severity        NVARCHAR(50) NOT NULL DEFAULT 'high',
+        validation_key  NVARCHAR(200) NOT NULL,
+        validation_value NVARCHAR(MAX) NOT NULL DEFAULT 'true',
+        remediation     NVARCHAR(MAX) DEFAULT '',
+        enabled         BIT DEFAULT 0,
+        created_at      NVARCHAR(50) NOT NULL,
+        updated_at      NVARCHAR(50) NOT NULL
+    )
+    """,
+    # ── Governance: Compliance Frameworks ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'compliance_frameworks')
+    CREATE TABLE compliance_frameworks (
+        id          NVARCHAR(100) PRIMARY KEY,
+        name        NVARCHAR(200) NOT NULL,
+        description NVARCHAR(MAX) DEFAULT '',
+        version     NVARCHAR(50) DEFAULT '1.0',
+        enabled     BIT DEFAULT 0,
+        created_at  NVARCHAR(50) NOT NULL
+    )
+    """,
+    # ── Governance: Compliance Controls ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'compliance_controls')
+    CREATE TABLE compliance_controls (
+        id                      NVARCHAR(100) PRIMARY KEY,
+        framework_id            NVARCHAR(100) NOT NULL,
+        control_id              NVARCHAR(100) NOT NULL,
+        name                    NVARCHAR(200) NOT NULL,
+        description             NVARCHAR(MAX) DEFAULT '',
+        category                NVARCHAR(100) DEFAULT '',
+        security_standard_ids_json NVARCHAR(MAX) DEFAULT '[]',
+        created_at              NVARCHAR(50) NOT NULL,
+        FOREIGN KEY (framework_id) REFERENCES compliance_frameworks(id)
+    )
+    """,
+    # ── Governance: Azure Services Catalog ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'services')
+    CREATE TABLE services (
+        id              NVARCHAR(200) PRIMARY KEY,
+        name            NVARCHAR(200) NOT NULL,
+        category        NVARCHAR(100) NOT NULL DEFAULT 'other',
+        status          NVARCHAR(50) NOT NULL DEFAULT 'not_approved',
+        risk_tier       NVARCHAR(50) NOT NULL DEFAULT 'medium',
+        conditions_json NVARCHAR(MAX) DEFAULT '[]',
+        review_notes    NVARCHAR(MAX) DEFAULT '',
+        documentation   NVARCHAR(500) DEFAULT '',
+        contact         NVARCHAR(200) DEFAULT '',
+        rejection_reason NVARCHAR(MAX) DEFAULT '',
+        approved_date   NVARCHAR(50) DEFAULT '',
+        reviewed_by     NVARCHAR(200) DEFAULT '',
+        created_at      NVARCHAR(50) NOT NULL,
+        updated_at      NVARCHAR(50) NOT NULL
+    )
+    """,
+    # ── Governance: Per-service policies ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'service_policies')
+    CREATE TABLE service_policies (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        service_id      NVARCHAR(200) NOT NULL,
+        policy_text     NVARCHAR(MAX) NOT NULL,
+        security_standard_id NVARCHAR(100),
+        enabled         BIT DEFAULT 1,
+        FOREIGN KEY (service_id) REFERENCES services(id),
+        FOREIGN KEY (security_standard_id) REFERENCES security_standards(id)
+    )
+    """,
+    # ── Governance: Approved SKUs ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'service_approved_skus')
+    CREATE TABLE service_approved_skus (
+        id          INT IDENTITY(1,1) PRIMARY KEY,
+        service_id  NVARCHAR(200) NOT NULL,
+        sku         NVARCHAR(100) NOT NULL,
+        FOREIGN KEY (service_id) REFERENCES services(id)
+    )
+    """,
+    # ── Governance: Approved Regions ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'service_approved_regions')
+    CREATE TABLE service_approved_regions (
+        id          INT IDENTITY(1,1) PRIMARY KEY,
+        service_id  NVARCHAR(200) NOT NULL,
+        region      NVARCHAR(100) NOT NULL,
+        FOREIGN KEY (service_id) REFERENCES services(id)
+    )
+    """,
+    # ── Governance: Organization-wide policies ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'governance_policies')
+    CREATE TABLE governance_policies (
+        id          NVARCHAR(100) PRIMARY KEY,
+        name        NVARCHAR(200) NOT NULL,
+        description NVARCHAR(MAX) DEFAULT '',
+        category    NVARCHAR(100) NOT NULL,
+        rule_key    NVARCHAR(200) NOT NULL,
+        rule_value_json NVARCHAR(MAX) NOT NULL,
+        severity    NVARCHAR(50) NOT NULL DEFAULT 'high',
+        enforcement NVARCHAR(50) NOT NULL DEFAULT 'block',
+        enabled     BIT DEFAULT 0,
+        created_at  NVARCHAR(50) NOT NULL,
+        updated_at  NVARCHAR(50) NOT NULL
+    )
+    """,
+    # ── Governance: Compliance Assessments ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'compliance_assessments')
+    CREATE TABLE compliance_assessments (
+        id                  NVARCHAR(100) PRIMARY KEY,
+        approval_request_id NVARCHAR(100),
+        assessed_at         NVARCHAR(50) NOT NULL,
+        assessed_by         NVARCHAR(200) DEFAULT 'InfraForge',
+        overall_result      NVARCHAR(50) NOT NULL DEFAULT 'pending',
+        standards_checked_json NVARCHAR(MAX) DEFAULT '[]',
+        findings_json       NVARCHAR(MAX) DEFAULT '[]',
+        score               FLOAT DEFAULT 0.0,
+        FOREIGN KEY (approval_request_id) REFERENCES approval_requests(id)
+    )
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'projects')
+    CREATE TABLE projects (
+        id              NVARCHAR(100) PRIMARY KEY,
+        name            NVARCHAR(200) NOT NULL,
+        description     NVARCHAR(MAX) DEFAULT '',
+        owner_email     NVARCHAR(200) NOT NULL,
+        department      NVARCHAR(200) DEFAULT '',
+        cost_center     NVARCHAR(100) DEFAULT '',
+        status          NVARCHAR(50) DEFAULT 'draft',
+        phase           NVARCHAR(50) DEFAULT 'requirements',
+        created_at      NVARCHAR(50) NOT NULL,
+        updated_at      NVARCHAR(50) NOT NULL,
+        metadata_json   NVARCHAR(MAX) DEFAULT '{}'
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_chat_session')
+    CREATE INDEX idx_chat_session ON chat_messages(session_token)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_usage_timestamp')
+    CREATE INDEX idx_usage_timestamp ON usage_logs(timestamp)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_usage_department')
+    CREATE INDEX idx_usage_department ON usage_logs(department)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_approval_status')
+    CREATE INDEX idx_approval_status ON approval_requests(status)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_projects_owner')
+    CREATE INDEX idx_projects_owner ON projects(owner_email)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_services_category')
+    CREATE INDEX idx_services_category ON services(category)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_services_status')
+    CREATE INDEX idx_services_status ON services(status)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_security_standards_category')
+    CREATE INDEX idx_security_standards_category ON security_standards(category)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_governance_policies_category')
+    CREATE INDEX idx_governance_policies_category ON governance_policies(category)""",
+    # ── CAF alignment: add risk_id, policy_statement, purpose, scope, remediation, enforcement_tool to governance_policies ──
+    """IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('governance_policies') AND name = 'risk_id')
+    ALTER TABLE governance_policies ADD risk_id NVARCHAR(50) DEFAULT ''""",
+    """IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('governance_policies') AND name = 'policy_statement')
+    ALTER TABLE governance_policies ADD policy_statement NVARCHAR(MAX) DEFAULT ''""",
+    """IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('governance_policies') AND name = 'purpose')
+    ALTER TABLE governance_policies ADD purpose NVARCHAR(MAX) DEFAULT ''""",
+    """IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('governance_policies') AND name = 'scope')
+    ALTER TABLE governance_policies ADD scope NVARCHAR(500) DEFAULT 'All cloud resources'""",
+    """IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('governance_policies') AND name = 'remediation')
+    ALTER TABLE governance_policies ADD remediation NVARCHAR(MAX) DEFAULT ''""",
+    """IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('governance_policies') AND name = 'enforcement_tool')
+    ALTER TABLE governance_policies ADD enforcement_tool NVARCHAR(200) DEFAULT ''""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_service_policies_service')
+    CREATE INDEX idx_service_policies_service ON service_policies(service_id)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_compliance_assessments_request')
+    CREATE INDEX idx_compliance_assessments_request ON compliance_assessments(approval_request_id)""",
+    # ── Deployments ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'deployments')
+    CREATE TABLE deployments (
+        deployment_id       NVARCHAR(100) PRIMARY KEY,
+        deployment_name     NVARCHAR(200) NOT NULL,
+        resource_group      NVARCHAR(200) NOT NULL,
+        region              NVARCHAR(100) NOT NULL,
+        status              NVARCHAR(50) NOT NULL DEFAULT 'pending',
+        phase               NVARCHAR(50) DEFAULT 'init',
+        progress            FLOAT DEFAULT 0.0,
+        detail              NVARCHAR(MAX) DEFAULT '',
+        template_hash       NVARCHAR(100) DEFAULT '',
+        initiated_by        NVARCHAR(200) DEFAULT 'agent',
+        started_at          NVARCHAR(50) NOT NULL,
+        completed_at        NVARCHAR(50),
+        error               NVARCHAR(MAX),
+        resources_json      NVARCHAR(MAX) DEFAULT '[]',
+        what_if_json        NVARCHAR(MAX),
+        outputs_json        NVARCHAR(MAX) DEFAULT '{}'
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_deployments_status')
+    CREATE INDEX idx_deployments_status ON deployments(status)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_deployments_rg')
+    CREATE INDEX idx_deployments_rg ON deployments(resource_group)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_deployments_initiated_by')
+    CREATE INDEX idx_deployments_initiated_by ON deployments(initiated_by)""",
+    # ── Deployment template tracking (migration) ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('deployments') AND name = 'template_id'
+    )
+    ALTER TABLE deployments ADD template_id NVARCHAR(200) DEFAULT ''
+    """,
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('deployments') AND name = 'template_name'
+    )
+    ALTER TABLE deployments ADD template_name NVARCHAR(200) DEFAULT ''
+    """,
+    # ── Deployment subscription_id tracking (migration) ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('deployments') AND name = 'subscription_id'
+    )
+    ALTER TABLE deployments ADD subscription_id NVARCHAR(100) DEFAULT ''
+    """,
+    # ── Deployment torn_down tracking (migration) ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('deployments') AND name = 'torn_down_at'
+    )
+    ALTER TABLE deployments ADD torn_down_at NVARCHAR(50)
+    """,
+    # ── Deployment template version tracking (migration) ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('deployments') AND name = 'template_version'
+    )
+    ALTER TABLE deployments ADD template_version INT DEFAULT 0
+    """,
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('deployments') AND name = 'template_semver'
+    )
+    ALTER TABLE deployments ADD template_semver NVARCHAR(20) DEFAULT ''
+    """,
+    # ── Service Artifacts (3-gate approval) ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'service_artifacts')
+    CREATE TABLE service_artifacts (
+        id              NVARCHAR(300) PRIMARY KEY,
+        service_id      NVARCHAR(200) NOT NULL,
+        artifact_type   NVARCHAR(50) NOT NULL,
+        status          NVARCHAR(50) DEFAULT 'not_started',
+        content         NVARCHAR(MAX),
+        notes           NVARCHAR(MAX) DEFAULT '',
+        approved_by     NVARCHAR(200),
+        approved_at     NVARCHAR(50),
+        created_at      NVARCHAR(50) NOT NULL,
+        updated_at      NVARCHAR(50) NOT NULL
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_artifacts_service')
+    CREATE INDEX idx_artifacts_service ON service_artifacts(service_id)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_artifacts_type')
+    CREATE INDEX idx_artifacts_type ON service_artifacts(artifact_type)""",
+    # ── Service Versions (versioned ARM templates) ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'service_versions')
+    CREATE TABLE service_versions (
+        id                      INT IDENTITY(1,1) PRIMARY KEY,
+        service_id              NVARCHAR(200) NOT NULL,
+        version                 INT NOT NULL DEFAULT 1,
+        arm_template            NVARCHAR(MAX) NOT NULL,
+        status                  NVARCHAR(50) DEFAULT 'draft',
+        validation_result_json  NVARCHAR(MAX) DEFAULT '{}',
+        policy_check_json       NVARCHAR(MAX) DEFAULT '{}',
+        changelog               NVARCHAR(MAX) DEFAULT '',
+        created_by              NVARCHAR(200) DEFAULT 'auto-generated',
+        created_at              NVARCHAR(50) NOT NULL,
+        validated_at            NVARCHAR(50),
+        UNIQUE (service_id, version)
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_svc_versions_service')
+    CREATE INDEX idx_svc_versions_service ON service_versions(service_id)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_svc_versions_status')
+    CREATE INDEX idx_svc_versions_status ON service_versions(status)""",
+    # Add active_version column to services if it doesn't exist
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('services') AND name = 'active_version'
+    )
+    ALTER TABLE services ADD active_version INT DEFAULT NULL
+    """,
+    # ── Deployment tracking columns on service_versions ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('service_versions') AND name = 'run_id'
+    )
+    ALTER TABLE service_versions ADD run_id NVARCHAR(50) DEFAULT NULL
+    """,
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('service_versions') AND name = 'resource_group'
+    )
+    ALTER TABLE service_versions ADD resource_group NVARCHAR(200) DEFAULT NULL
+    """,
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('service_versions') AND name = 'deployment_name'
+    )
+    ALTER TABLE service_versions ADD deployment_name NVARCHAR(200) DEFAULT NULL
+    """,
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('service_versions') AND name = 'subscription_id'
+    )
+    ALTER TABLE service_versions ADD subscription_id NVARCHAR(100) DEFAULT NULL
+    """,
+    # ── Semver column on service_versions ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('service_versions') AND name = 'semver'
+    )
+    ALTER TABLE service_versions ADD semver NVARCHAR(20) DEFAULT NULL
+    """,
+    # ── Parent-child co-validation tracking ──
+    # JSON: {"parent_service_id": "...", "parent_version": N, "parent_api_version": "..."}
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('service_versions') AND name = 'validated_with_parent'
+    )
+    ALTER TABLE service_versions ADD validated_with_parent NVARCHAR(MAX) DEFAULT NULL
+    """,
+    # ── Azure Policy JSON storage on service_versions ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('service_versions') AND name = 'azure_policy_json'
+    )
+    ALTER TABLE service_versions ADD azure_policy_json NVARCHAR(MAX) DEFAULT NULL
+    """,
+    # ── Template Catalog ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'catalog_templates')
+    CREATE TABLE catalog_templates (
+        id              NVARCHAR(200) PRIMARY KEY,
+        name            NVARCHAR(200) NOT NULL,
+        description     NVARCHAR(MAX) DEFAULT '',
+        format          NVARCHAR(50) NOT NULL DEFAULT 'bicep',
+        category        NVARCHAR(100) NOT NULL DEFAULT 'compute',
+        source_path     NVARCHAR(500) DEFAULT '',
+        content         NVARCHAR(MAX) DEFAULT '',
+        tags_json       NVARCHAR(MAX) DEFAULT '[]',
+        resources_json  NVARCHAR(MAX) DEFAULT '[]',
+        parameters_json NVARCHAR(MAX) DEFAULT '[]',
+        outputs_json    NVARCHAR(MAX) DEFAULT '[]',
+        service_ids_json NVARCHAR(MAX) DEFAULT '[]',
+        is_blueprint    BIT DEFAULT 0,
+        registered_by   NVARCHAR(200) DEFAULT 'platform-team',
+        status          NVARCHAR(50) DEFAULT 'approved',
+        created_at      NVARCHAR(50) NOT NULL,
+        updated_at      NVARCHAR(50) NOT NULL
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_templates_category')
+    CREATE INDEX idx_templates_category ON catalog_templates(category)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_templates_format')
+    CREATE INDEX idx_templates_format ON catalog_templates(format)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_templates_status')
+    CREATE INDEX idx_templates_status ON catalog_templates(status)""",
+    # ── Template Dependency Columns (migration) ──
+    # template_type: foundation / workload / composite
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('catalog_templates') AND name = 'template_type'
+    )
+    ALTER TABLE catalog_templates ADD template_type NVARCHAR(30) DEFAULT 'workload'
+    """,
+    # provides_json: resource types this template creates
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('catalog_templates') AND name = 'provides_json'
+    )
+    ALTER TABLE catalog_templates ADD provides_json NVARCHAR(MAX) DEFAULT '[]'
+    """,
+    # requires_json: existing resources needed at deploy time
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('catalog_templates') AND name = 'requires_json'
+    )
+    ALTER TABLE catalog_templates ADD requires_json NVARCHAR(MAX) DEFAULT '[]'
+    """,
+    # optional_refs_json: optional existing resources that can be referenced
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('catalog_templates') AND name = 'optional_refs_json'
+    )
+    ALTER TABLE catalog_templates ADD optional_refs_json NVARCHAR(MAX) DEFAULT '[]'
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_templates_type')
+    CREATE INDEX idx_templates_type ON catalog_templates(template_type)""",
+    # ── Template Versioning ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'template_versions')
+    CREATE TABLE template_versions (
+        id                      INT IDENTITY(1,1) PRIMARY KEY,
+        template_id             NVARCHAR(200) NOT NULL,
+        version                 INT NOT NULL DEFAULT 1,
+        arm_template            NVARCHAR(MAX) NOT NULL,
+        status                  NVARCHAR(50) DEFAULT 'draft',
+        test_results_json       NVARCHAR(MAX) DEFAULT '{}',
+        changelog               NVARCHAR(MAX) DEFAULT '',
+        semver                  NVARCHAR(20) DEFAULT NULL,
+        created_by              NVARCHAR(200) DEFAULT 'template-composer',
+        created_at              NVARCHAR(50) NOT NULL,
+        tested_at               NVARCHAR(50),
+        UNIQUE (template_id, version)
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_tmpl_versions_template')
+    CREATE INDEX idx_tmpl_versions_template ON template_versions(template_id)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_tmpl_versions_status')
+    CREATE INDEX idx_tmpl_versions_status ON template_versions(status)""",
+    # Add active_version to catalog_templates
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('catalog_templates') AND name = 'active_version'
+    )
+    ALTER TABLE catalog_templates ADD active_version INT DEFAULT NULL
+    """,
+    # Add validation_results_json + validated_at to template_versions
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('template_versions') AND name = 'validation_results_json'
+    )
+    ALTER TABLE template_versions ADD validation_results_json NVARCHAR(MAX) DEFAULT NULL
+    """,
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('template_versions') AND name = 'validated_at'
+    )
+    ALTER TABLE template_versions ADD validated_at NVARCHAR(50) DEFAULT NULL
+    """,
+    # ══════════════════════════════════════════════════════════
+    # ORCHESTRATION PROCESSES — Step-by-step workflows the LLM
+    # reads at runtime to know what to do.
+    # ══════════════════════════════════════════════════════════
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'orchestration_processes')
+    CREATE TABLE orchestration_processes (
+        id              NVARCHAR(100) PRIMARY KEY,
+        name            NVARCHAR(200) NOT NULL,
+        description     NVARCHAR(MAX) DEFAULT '',
+        trigger_event   NVARCHAR(200) NOT NULL,
+        enabled         BIT DEFAULT 1,
+        created_at      NVARCHAR(50) NOT NULL,
+        updated_at      NVARCHAR(50) NOT NULL
+    )
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'process_steps')
+    CREATE TABLE process_steps (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        process_id      NVARCHAR(100) NOT NULL,
+        step_order      INT NOT NULL,
+        name            NVARCHAR(200) NOT NULL,
+        description     NVARCHAR(MAX) NOT NULL,
+        action          NVARCHAR(200) NOT NULL,
+        condition_json  NVARCHAR(MAX) DEFAULT '{}',
+        on_success      NVARCHAR(200) DEFAULT 'next',
+        on_failure      NVARCHAR(200) DEFAULT 'abort',
+        config_json     NVARCHAR(MAX) DEFAULT '{}',
+        FOREIGN KEY (process_id) REFERENCES orchestration_processes(id)
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_process_steps_process')
+    CREATE INDEX idx_process_steps_process ON process_steps(process_id, step_order)""",
+    # ── Compliance profile on templates ──
+    # JSON array of GOV_CATEGORIES IDs (e.g. ["encryption","compliance_hipaa"])
+    # NULL = not configured (scan uses all standards), [] = exempt (skip all)
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('catalog_templates') AND name = 'compliance_profile_json'
+    )
+    ALTER TABLE catalog_templates ADD compliance_profile_json NVARCHAR(MAX) DEFAULT NULL
+    """,
+    # ── Pinned service versions on composed templates ──
+    # Maps service_id → {version, semver} at compose time
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('catalog_templates') AND name = 'pinned_versions_json'
+    )
+    ALTER TABLE catalog_templates ADD pinned_versions_json NVARCHAR(MAX) DEFAULT NULL
+    """,
+    # ── Azure API version tracking on services ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('services') AND name = 'latest_api_version'
+    )
+    ALTER TABLE services ADD latest_api_version NVARCHAR(50) DEFAULT NULL
+    """,
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('services') AND name = 'default_api_version'
+    )
+    ALTER TABLE services ADD default_api_version NVARCHAR(50) DEFAULT NULL
+    """,
+    # ── Template API version (apiVersion from the active ARM template) ──
+    """
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('services') AND name = 'template_api_version'
+    )
+    ALTER TABLE services ADD template_api_version NVARCHAR(50) DEFAULT NULL
+    """,
+    # ── Widen API version columns (values like '2022-03-08-privatepreview' exceed 20 chars) ──
+    """
+    IF COL_LENGTH('services', 'latest_api_version') < 100
+        ALTER TABLE services ALTER COLUMN latest_api_version NVARCHAR(50)
+    """,
+    """
+    IF COL_LENGTH('services', 'default_api_version') < 100
+        ALTER TABLE services ALTER COLUMN default_api_version NVARCHAR(50)
+    """,
+    """
+    IF COL_LENGTH('services', 'template_api_version') < 100
+        ALTER TABLE services ALTER COLUMN template_api_version NVARCHAR(50)
+    """,
+    # ══════════════════════════════════════════════════════════
+    # PIPELINE RUNS — Persistent log of every pipeline execution
+    # so users can see run history, status, and duration after
+    # page refresh. Each run links to a service + version.
+    # ══════════════════════════════════════════════════════════
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'pipeline_runs')
+    CREATE TABLE pipeline_runs (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        run_id          NVARCHAR(50) NOT NULL,
+        service_id      NVARCHAR(200) NOT NULL,
+        pipeline_type   NVARCHAR(50) NOT NULL,
+        status          NVARCHAR(30) NOT NULL DEFAULT 'running',
+        version_num     INT DEFAULT NULL,
+        semver          NVARCHAR(20) DEFAULT NULL,
+        started_at      NVARCHAR(50) NOT NULL,
+        completed_at    NVARCHAR(50) DEFAULT NULL,
+        duration_secs   FLOAT DEFAULT NULL,
+        summary_json    NVARCHAR(MAX) DEFAULT '{}',
+        error_detail    NVARCHAR(MAX) DEFAULT NULL,
+        created_by      NVARCHAR(200) DEFAULT NULL,
+        heal_count      INT DEFAULT 0
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_pipeline_runs_service')
+    CREATE INDEX idx_pipeline_runs_service ON pipeline_runs(service_id, started_at DESC)""",
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_pipeline_runs_runid')
+    CREATE UNIQUE INDEX idx_pipeline_runs_runid ON pipeline_runs(run_id)""",
+    # ── pipeline_events_json column — stores full NDJSON event stream for replay ──
+    """IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('pipeline_runs') AND name = 'pipeline_events_json'
+    )
+    ALTER TABLE pipeline_runs ADD pipeline_events_json NVARCHAR(MAX) DEFAULT NULL
+    """,
+    # ── Pipeline checkpoint columns — enable resume after server restart ──
+    """IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('pipeline_runs') AND name = 'last_completed_step'
+    )
+    ALTER TABLE pipeline_runs ADD last_completed_step INT DEFAULT NULL
+    """,
+    """IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('pipeline_runs') AND name = 'checkpoint_context_json'
+    )
+    ALTER TABLE pipeline_runs ADD checkpoint_context_json NVARCHAR(MAX) DEFAULT NULL
+    """,
+    """IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('pipeline_runs') AND name = 'resume_count'
+    )
+    ALTER TABLE pipeline_runs ADD resume_count INT DEFAULT 0
+    """,
+    # ── last_event_at column — timestamp of last progress event (for stuck detection) ──
+    """IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('pipeline_runs') AND name = 'last_event_at'
+    )
+    ALTER TABLE pipeline_runs ADD last_event_at NVARCHAR(50) DEFAULT NULL
+    """,
+    # ── Pipeline Checkpoints table — step-level persistence for resumability ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'pipeline_checkpoints')
+    CREATE TABLE pipeline_checkpoints (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        run_id          NVARCHAR(50) NOT NULL,
+        step_name       NVARCHAR(200) NOT NULL,
+        step_index      INT NOT NULL,
+        status          NVARCHAR(30) NOT NULL DEFAULT 'completed',
+        artifacts_json  NVARCHAR(MAX) DEFAULT '{}',
+        completed_at    NVARCHAR(50) NOT NULL,
+        duration_secs   FLOAT DEFAULT NULL
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_pipeline_checkpoints_run')
+    CREATE INDEX idx_pipeline_checkpoints_run ON pipeline_checkpoints(run_id, step_index)
+    """,
+    # ── Governance reviews ────────────────────────────────────
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'governance_reviews')
+    CREATE TABLE governance_reviews (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        service_id      NVARCHAR(200) NOT NULL,
+        version         INT NOT NULL,
+        semver          NVARCHAR(20) DEFAULT NULL,
+        pipeline_type   NVARCHAR(50) DEFAULT 'onboarding',
+        run_id          NVARCHAR(50) DEFAULT NULL,
+        agent           NVARCHAR(20) NOT NULL,
+        verdict         NVARCHAR(30) NOT NULL,
+        confidence      FLOAT DEFAULT 0,
+        summary         NVARCHAR(MAX) DEFAULT '',
+        findings_json   NVARCHAR(MAX) DEFAULT '[]',
+        risk_score      INT DEFAULT NULL,
+        architecture_score INT DEFAULT NULL,
+        security_posture NVARCHAR(30) DEFAULT NULL,
+        cost_assessment NVARCHAR(30) DEFAULT NULL,
+        gate_decision   NVARCHAR(30) DEFAULT NULL,
+        gate_reason     NVARCHAR(MAX) DEFAULT NULL,
+        model_used      NVARCHAR(100) DEFAULT NULL,
+        reviewed_at     NVARCHAR(50) NOT NULL,
+        created_by      NVARCHAR(200) DEFAULT NULL
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_gov_reviews_service')
+    CREATE INDEX idx_gov_reviews_service ON governance_reviews(service_id, version DESC)""",
+    # ── Agent Activity Tracking ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'agent_counters')
+    CREATE TABLE agent_counters (
+        agent_name      NVARCHAR(200) PRIMARY KEY,
+        calls           INT DEFAULT 0,
+        errors          INT DEFAULT 0,
+        total_ms        FLOAT DEFAULT 0,
+        last_called     NVARCHAR(50) DEFAULT NULL,
+        last_model      NVARCHAR(100) DEFAULT NULL
+    )
+    """,
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'agent_activity_log')
+    CREATE TABLE agent_activity_log (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        agent_name      NVARCHAR(200) NOT NULL,
+        model           NVARCHAR(100) DEFAULT '',
+        status          NVARCHAR(20) DEFAULT 'ok',
+        duration_ms     FLOAT DEFAULT 0,
+        prompt_len      INT DEFAULT 0,
+        response_len    INT DEFAULT 0,
+        error_text      NVARCHAR(MAX) DEFAULT NULL,
+        created_at      NVARCHAR(50) NOT NULL
+    )
+    """,
+    # ══════════════════════════════════════════════════════════
+    # AGENT DEFINITIONS — externalised agent prompts & config
+    # so platform engineers can iterate on prompts without
+    # code changes or server restarts.
+    # ══════════════════════════════════════════════════════════
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'agent_definitions')
+    CREATE TABLE agent_definitions (
+        id              NVARCHAR(100) PRIMARY KEY,
+        name            NVARCHAR(200) NOT NULL,
+        description     NVARCHAR(MAX) DEFAULT '',
+        system_prompt   NVARCHAR(MAX) NOT NULL,
+        task            NVARCHAR(50) NOT NULL,
+        timeout         INT DEFAULT 60,
+        category        NVARCHAR(50) DEFAULT 'headless',
+        enabled         BIT DEFAULT 1,
+        version         INT DEFAULT 1,
+        created_at      NVARCHAR(50) NOT NULL,
+        updated_at      NVARCHAR(50) NOT NULL
+    )
+    """,
+    # ── Agent prompt version history ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'agent_prompt_history')
+    CREATE TABLE agent_prompt_history (
+        id              INT IDENTITY(1,1) PRIMARY KEY,
+        agent_id        NVARCHAR(100) NOT NULL,
+        version         INT NOT NULL,
+        system_prompt   NVARCHAR(MAX) NOT NULL,
+        changed_by      NVARCHAR(200) DEFAULT 'system',
+        changed_at      NVARCHAR(50) NOT NULL,
+        FOREIGN KEY (agent_id) REFERENCES agent_definitions(id)
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_agent_prompt_history')
+    CREATE INDEX idx_agent_prompt_history ON agent_prompt_history(agent_id, version DESC)""",
+    # ── Agent performance rating columns on agent_counters ──
+    """IF NOT EXISTS (
+        SELECT 1 FROM sys.columns
+        WHERE object_id = OBJECT_ID('agent_counters') AND name = 'performance_score'
+    )
+    ALTER TABLE agent_counters ADD
+        performance_score  INT DEFAULT 50,
+        reliability_score  INT DEFAULT 50,
+        speed_score        INT DEFAULT 50,
+        quality_score      INT DEFAULT 50,
+        total_misses       INT DEFAULT 0,
+        last_score_update  NVARCHAR(50) DEFAULT NULL
+    """,
+    # ── Agent misses — automatic + manual miss events ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'agent_misses')
+    CREATE TABLE agent_misses (
+        id                INT IDENTITY(1,1) PRIMARY KEY,
+        agent_name        NVARCHAR(200) NOT NULL,
+        miss_type         NVARCHAR(50) NOT NULL,
+        context_summary   NVARCHAR(MAX) DEFAULT '',
+        error_detail      NVARCHAR(MAX) DEFAULT '',
+        input_preview     NVARCHAR(MAX) DEFAULT '',
+        output_preview    NVARCHAR(MAX) DEFAULT '',
+        pipeline_phase    NVARCHAR(100) DEFAULT NULL,
+        resolved          BIT DEFAULT 0,
+        resolution_note   NVARCHAR(MAX) DEFAULT NULL,
+        created_at        NVARCHAR(50) NOT NULL
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_agent_misses_agent')
+    CREATE INDEX idx_agent_misses_agent ON agent_misses(agent_name, created_at DESC)""",
+    # ── Agent feedback — manual thumbs up/down ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'agent_feedback')
+    CREATE TABLE agent_feedback (
+        id                INT IDENTITY(1,1) PRIMARY KEY,
+        agent_name        NVARCHAR(200) NOT NULL,
+        activity_id       INT DEFAULT NULL,
+        rating            INT NOT NULL,
+        comment           NVARCHAR(500) DEFAULT '',
+        created_at        NVARCHAR(50) NOT NULL
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_agent_feedback_agent')
+    CREATE INDEX idx_agent_feedback_agent ON agent_feedback(agent_name, created_at DESC)""",
+    # ── Prompt improvement queue — LLM-suggested prompt patches ──
+    """
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'prompt_improvement_queue')
+    CREATE TABLE prompt_improvement_queue (
+        id                INT IDENTITY(1,1) PRIMARY KEY,
+        agent_name        NVARCHAR(200) NOT NULL,
+        miss_pattern      NVARCHAR(MAX) DEFAULT '',
+        miss_count        INT DEFAULT 0,
+        suggested_patch   NVARCHAR(MAX) DEFAULT '',
+        reasoning         NVARCHAR(MAX) DEFAULT '',
+        status            NVARCHAR(20) DEFAULT 'pending',
+        reviewed_by       NVARCHAR(200) DEFAULT NULL,
+        reviewed_at       NVARCHAR(50) DEFAULT NULL,
+        created_at        NVARCHAR(50) NOT NULL
+    )
+    """,
+    """IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_prompt_improvement_agent')
+    CREATE INDEX idx_prompt_improvement_agent ON prompt_improvement_queue(agent_name, status)""",
+]
+
+
+# ══════════════════════════════════════════════════════════════
+# BACKEND FACTORY
+# ══════════════════════════════════════════════════════════════
+
+_backend: Optional[DatabaseBackend] = None
+
+
+async def get_backend() -> DatabaseBackend:
+    """Get or create the Azure SQL Database backend singleton.
+
+    Requires AZURE_SQL_CONNECTION_STRING to be set in the environment.
+    """
+    global _backend
+    if _backend is not None:
+        return _backend
+
+    connection_string = os.getenv("AZURE_SQL_CONNECTION_STRING", "")
+    if not connection_string:
+        raise RuntimeError(
+            "AZURE_SQL_CONNECTION_STRING environment variable is required. "
+            "Set it to your Azure SQL Database connection string."
+        )
+
+    _backend = AzureSQLBackend(connection_string)
+    logger.info("Using Azure SQL Database backend")
+    return _backend
+
+
+async def init_db() -> None:
+    """Initialize the database and seed governance data on first run."""
+    backend = await get_backend()
+    await backend.init()
+    # Seed governance tables on first run (no-op if already populated)
+    await seed_governance_data()
+    # ── Lifecycle integrity: reset templates that were shortcutted to
+    #    'approved' without completing the validation pipeline.
+    #    A template is considered shortcutted if it is 'approved' but has
+    #    no validated version (no semver assigned and no validated_at). ──
+    try:
+        await backend.execute_write(
+            """
+            UPDATE catalog_templates
+               SET status   = 'draft',
+                   updated_at = ?
+             WHERE status = 'approved'
+               AND id NOT IN (
+                   SELECT DISTINCT template_id
+                     FROM template_versions
+                    WHERE status = 'approved'
+                      AND semver IS NOT NULL
+               )
+            """,
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+    except Exception as exc:
+        logger.warning(f"Template lifecycle migration skipped: {exc}")
+
+    # ── Backfill template_api_version for services missing it ──
+    try:
+        rows = await backend.execute(
+            "SELECT id, active_version FROM services "
+            "WHERE active_version IS NOT NULL AND template_api_version IS NULL",
+            (),
+        )
+        if rows:
+            backfilled = 0
+            for row in rows:
+                sid, ver = row["id"], row["active_version"]
+                ver_rows = await backend.execute(
+                    "SELECT arm_template FROM service_versions "
+                    "WHERE service_id = ? AND version = ?",
+                    (sid, ver),
+                )
+                if not ver_rows:
+                    continue
+                arm_str = ver_rows[0].get("arm_template", "")
+                if not arm_str:
+                    continue
+                try:
+                    tpl = json.loads(arm_str)
+                    resources = tpl.get("resources", [])
+                    api_versions = sorted(
+                        {r.get("apiVersion", "") for r in resources
+                         if isinstance(r, dict) and r.get("apiVersion")},
+                        reverse=True,
+                    )
+                    if api_versions:
+                        await backend.execute_write(
+                            "UPDATE services SET template_api_version = ? WHERE id = ?",
+                            (api_versions[0], sid),
+                        )
+                        backfilled += 1
+                except Exception:
+                    pass
+            if backfilled:
+                logger.info(f"Backfilled template_api_version for {backfilled} services")
+    except Exception as exc:
+        logger.warning(f"template_api_version backfill skipped: {exc}")
+
+
+# ══════════════════════════════════════════════════════════════
+# USER SESSIONS
+# ══════════════════════════════════════════════════════════════
+
+async def save_session(
+    session_token: str,
+    user_data: dict,
+    access_token: str = "",
+    claims: dict | None = None,
+    ttl_hours: float = 8.0,
+) -> None:
+    """Persist a user session."""
+    now = time.time()
+    backend = await get_backend()
+
+    # DELETE + INSERT for upsert behavior
+    await backend.execute_write(
+        "DELETE FROM user_sessions WHERE session_token = ?",
+        (session_token,),
+    )
+    await backend.execute_write(
+        """INSERT INTO user_sessions
+           (session_token, user_id, display_name, email, job_title,
+            department, cost_center, manager, groups_json, roles_json,
+            team, is_platform_team, is_admin, access_token, claims_json,
+            created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            session_token,
+            user_data.get("user_id", ""),
+            user_data.get("display_name", ""),
+            user_data.get("email", ""),
+            user_data.get("job_title", ""),
+            user_data.get("department", ""),
+            user_data.get("cost_center", ""),
+            user_data.get("manager", ""),
+            json.dumps(user_data.get("groups", [])),
+            json.dumps(user_data.get("roles", [])),
+            user_data.get("team", ""),
+            int(user_data.get("is_platform_team", False)),
+            int(user_data.get("is_admin", False)),
+            access_token,
+            json.dumps(claims or {}),
+            now,
+            now + (ttl_hours * 3600),
+        ),
+    )
+
+
+async def get_session(session_token: str) -> Optional[dict]:
+    """Retrieve a session if it exists and hasn't expired."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM user_sessions WHERE session_token = ? AND expires_at > ?",
+        (session_token, time.time()),
+    )
+    if not rows:
+        return None
+
+    row = rows[0]
+    return {
+        "session_token": row["session_token"],
+        "user_id": row["user_id"],
+        "display_name": row["display_name"],
+        "email": row["email"],
+        "job_title": row["job_title"],
+        "department": row["department"],
+        "cost_center": row["cost_center"],
+        "manager": row["manager"],
+        "groups": json.loads(row["groups_json"]),
+        "roles": json.loads(row["roles_json"]),
+        "team": row["team"],
+        "is_platform_team": bool(row["is_platform_team"]),
+        "is_admin": bool(row["is_admin"]),
+        "access_token": row["access_token"],
+        "claims": json.loads(row["claims_json"]),
+        "created_at": row["created_at"],
+    }
+
+
+async def delete_session(session_token: str) -> None:
+    """Remove a session (logout)."""
+    backend = await get_backend()
+    await backend.execute_write(
+        "DELETE FROM user_sessions WHERE session_token = ?",
+        (session_token,),
+    )
+
+
+async def cleanup_expired_sessions() -> int:
+    """Remove expired sessions. Returns count removed."""
+    backend = await get_backend()
+    return await backend.execute_write(
+        "DELETE FROM user_sessions WHERE expires_at <= ?",
+        (time.time(),),
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# CHAT MESSAGES
+# ══════════════════════════════════════════════════════════════
+
+async def save_chat_message(
+    session_token: str, role: str, content: str
+) -> None:
+    """Save a chat message to the conversation history."""
+    backend = await get_backend()
+    await backend.execute_write(
+        """INSERT INTO chat_messages (session_token, role, content, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (session_token, role, content, time.time()),
+    )
+
+
+async def get_chat_history(
+    session_token: str, limit: int = 100
+) -> list[dict]:
+    """Retrieve chat history for a session."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        """SELECT role, content, created_at FROM chat_messages
+           WHERE session_token = ?
+           ORDER BY created_at ASC""",
+        (session_token,),
+    )
+    return rows[:limit]
+
+
+async def get_user_chat_history(email: str, limit: int = 50) -> list[dict]:
+    """Retrieve chat history across all sessions for a user."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        """SELECT cm.role, cm.content, cm.created_at
+           FROM chat_messages cm
+           JOIN user_sessions us ON cm.session_token = us.session_token
+           WHERE us.email = ?
+           ORDER BY cm.created_at DESC""",
+        (email,),
+    )
+    return rows[:limit]
+
+
+# ══════════════════════════════════════════════════════════════
+# USAGE LOGS (Usage Analytics)
+# ══════════════════════════════════════════════════════════════
+
+async def log_usage(record: dict) -> None:
+    """Log a usage record for analytics.
+
+    When backed by Azure SQL, this data can be surfaced in:
+    - Power BI dashboards for org-wide spend visibility
+    - M365 Copilot for conversational analytics
+    """
+    backend = await get_backend()
+    await backend.execute_write(
+        """INSERT INTO usage_logs
+           (timestamp, user_email, department, cost_center, prompt,
+            resource_types_json, estimated_cost, from_catalog)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            record.get("timestamp", time.time()),
+            record.get("user", ""),
+            record.get("department", ""),
+            record.get("cost_center", ""),
+            record.get("prompt", ""),
+            json.dumps(record.get("resource_types", [])),
+            record.get("estimated_cost", 0.0),
+            int(record.get("from_catalog", False)),
+        ),
+    )
+
+
+async def get_usage_stats(
+    department: Optional[str] = None,
+    since_timestamp: Optional[float] = None,
+) -> dict:
+    """Aggregate usage statistics for the analytics dashboard."""
+    backend = await get_backend()
+
+    where_clauses: list[str] = []
+    params: list = []
+
+    if department:
+        where_clauses.append("department = ?")
+        params.append(department)
+    if since_timestamp:
+        where_clauses.append("timestamp >= ?")
+        params.append(since_timestamp)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    # Total requests
+    rows = await backend.execute(
+        f"SELECT COUNT(*) as total FROM usage_logs {where_sql}", tuple(params)
+    )
+    total = rows[0]["total"] if rows else 0
+
+    # Catalog reuse
+    catalog_where = f"{where_sql} {'AND' if where_clauses else 'WHERE'} from_catalog = 1"
+    rows = await backend.execute(
+        f"SELECT COUNT(*) as hits FROM usage_logs {catalog_where}",
+        tuple(params),
+    )
+    catalog_hits = rows[0]["hits"] if rows else 0
+
+    # Total estimated cost
+    rows = await backend.execute(
+        f"SELECT COALESCE(SUM(estimated_cost), 0) as total_cost FROM usage_logs {where_sql}",
+        tuple(params),
+    )
+    total_cost = rows[0]["total_cost"] if rows else 0
+
+    # By department
+    rows = await backend.execute(
+        f"""SELECT department, COUNT(*) as count
+            FROM usage_logs {where_sql}
+            GROUP BY department ORDER BY count DESC""",
+        tuple(params),
+    )
+    by_department = {row["department"]: row["count"] for row in rows}
+
+    # By user
+    rows = await backend.execute(
+        f"""SELECT user_email, COUNT(*) as count
+            FROM usage_logs {where_sql}
+            GROUP BY user_email ORDER BY count DESC""",
+        tuple(params),
+    )
+    by_user = {row["user_email"]: row["count"] for row in rows}
+
+    return {
+        "totalRequests": total,
+        "catalogReuseRate": round(catalog_hits / max(total, 1) * 100, 1),
+        "totalEstimatedMonthlyCost": round(total_cost, 2),
+        "byDepartment": by_department,
+        "byUser": by_user,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# APPROVAL REQUESTS
+# ══════════════════════════════════════════════════════════════
+
+async def save_approval_request(request: dict) -> str:
+    """Save a service approval request. Returns the request ID."""
+    request_id = request.get("id", f"SAR-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
+    submitted_at = request.get("submitted_at", datetime.now(timezone.utc).isoformat())
+
+    backend = await get_backend()
+    await backend.execute_write(
+        """INSERT INTO approval_requests
+           (id, service_name, service_resource_type, current_status,
+            risk_tier, business_justification, project_name, environment,
+            requestor_name, requestor_email, status, submitted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            request_id,
+            request.get("service_name", ""),
+            request.get("service_resource_type", "unknown"),
+            request.get("current_status", "not_in_catalog"),
+            request.get("risk_tier", "medium"),
+            request.get("business_justification", ""),
+            request.get("project_name", ""),
+            request.get("environment", "production"),
+            request.get("requestor", {}).get("name", ""),
+            request.get("requestor", {}).get("email", ""),
+            request.get("status", "submitted"),
+            submitted_at,
+        ),
+    )
+    return request_id
+
+
+async def get_approval_requests(
+    status: Optional[str] = None,
+    requestor_email: Optional[str] = None,
+) -> list[dict]:
+    """List approval requests with optional filtering."""
+    backend = await get_backend()
+
+    where_clauses: list[str] = []
+    params: list = []
+
+    if status:
+        where_clauses.append("status = ?")
+        params.append(status)
+    if requestor_email:
+        where_clauses.append("requestor_email = ?")
+        params.append(requestor_email)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    return await backend.execute(
+        f"SELECT * FROM approval_requests {where_sql} ORDER BY submitted_at DESC",
+        tuple(params),
+    )
+
+
+async def update_approval_request(
+    request_id: str,
+    status: str,
+    reviewer: str = "",
+    review_notes: str = "",
+) -> bool:
+    """Update the status of an approval request (platform team action)."""
+    backend = await get_backend()
+    count = await backend.execute_write(
+        """UPDATE approval_requests
+           SET status = ?, reviewer = ?, review_notes = ?, reviewed_at = ?
+           WHERE id = ?""",
+        (
+            status,
+            reviewer,
+            review_notes,
+            datetime.now(timezone.utc).isoformat(),
+            request_id,
+        ),
+    )
+    return count > 0
+
+
+# ══════════════════════════════════════════════════════════════
+# PROJECTS
+# ══════════════════════════════════════════════════════════════
+
+async def create_project(project: dict) -> str:
+    """Create a new infrastructure project."""
+    now = datetime.now(timezone.utc).isoformat()
+    project_id = project.get("id", f"PRJ-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
+
+    backend = await get_backend()
+    await backend.execute_write(
+        """INSERT INTO projects
+           (id, name, description, owner_email, department, cost_center,
+            status, phase, created_at, updated_at, metadata_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            project_id,
+            project.get("name", ""),
+            project.get("description", ""),
+            project.get("owner_email", ""),
+            project.get("department", ""),
+            project.get("cost_center", ""),
+            project.get("status", "draft"),
+            project.get("phase", "requirements"),
+            now,
+            now,
+            json.dumps(project.get("metadata", {})),
+        ),
+    )
+    return project_id
+
+
+async def get_project(project_id: str) -> Optional[dict]:
+    """Retrieve a project by ID."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM projects WHERE id = ?", (project_id,)
+    )
+    if not rows:
+        return None
+    result = rows[0]
+    result["metadata"] = json.loads(result.pop("metadata_json", None) or "{}")
+    return result
+
+
+async def list_projects(
+    owner_email: Optional[str] = None,
+    status: Optional[str] = None,
+    department: Optional[str] = None,
+) -> list[dict]:
+    """List projects with optional filtering."""
+    backend = await get_backend()
+
+    where_clauses: list[str] = []
+    params: list = []
+
+    if owner_email:
+        where_clauses.append("owner_email = ?")
+        params.append(owner_email)
+    if status:
+        where_clauses.append("status = ?")
+        params.append(status)
+    if department:
+        where_clauses.append("department = ?")
+        params.append(department)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    rows = await backend.execute(
+        f"SELECT * FROM projects {where_sql} ORDER BY updated_at DESC",
+        tuple(params),
+    )
+    for row in rows:
+        row["metadata"] = json.loads(row.pop("metadata_json", None) or "{}")
+    return rows
+
+
+async def update_project(project_id: str, updates: dict) -> bool:
+    """Update a project's fields."""
+    allowed_fields = {
+        "name", "description", "status", "phase",
+        "department", "cost_center",
+    }
+    set_clauses: list[str] = []
+    params: list = []
+
+    for field_name, value in updates.items():
+        if field_name in allowed_fields:
+            set_clauses.append(f"{field_name} = ?")
+            params.append(value)
+
+    if "metadata" in updates:
+        set_clauses.append("metadata_json = ?")
+        params.append(json.dumps(updates["metadata"]))
+
+    if not set_clauses:
+        return False
+
+    set_clauses.append("updated_at = ?")
+    params.append(datetime.now(timezone.utc).isoformat())
+    params.append(project_id)
+
+    backend = await get_backend()
+    count = await backend.execute_write(
+        f"UPDATE projects SET {', '.join(set_clauses)} WHERE id = ?",
+        tuple(params),
+    )
+    return count > 0
+
+
+# ══════════════════════════════════════════════════════════════
+# GOVERNANCE: SERVICES CATALOG
+# ══════════════════════════════════════════════════════════════
+
+
+async def bulk_insert_services(services: list[dict]) -> int:
+    """Insert many new services in a single DB connection/transaction.
+
+    This is used by the Azure sync to avoid thousands of individual round-trips.
+    Only inserts — does NOT delete/update existing services.
+    Each service dict should have: id, name, category, and optionally
+    status, risk_tier, review_notes, contact, approved_regions.
+
+    Returns the count of services inserted.
+    """
+    if not services:
+        return 0
+
+    import asyncio
+
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _run():
+        conn = backend._get_connection()
+        try:
+            cursor = conn.cursor()
+            count = 0
+            for svc in services:
+                try:
+                    cursor.execute(
+                        """IF NOT EXISTS (SELECT 1 FROM services WHERE id = ?)
+                           INSERT INTO services
+                           (id, name, category, status, risk_tier, conditions_json,
+                            review_notes, documentation, contact, rejection_reason,
+                            approved_date, reviewed_by, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            svc["id"],
+                            svc["id"],
+                            svc.get("name", ""),
+                            svc.get("category", "other"),
+                            svc.get("status", "not_approved"),
+                            svc.get("risk_tier", "medium"),
+                            "[]",
+                            svc.get("review_notes", ""),
+                            "",
+                            svc.get("contact", ""),
+                            "",
+                            "",
+                            "",
+                            now,
+                            now,
+                        ),
+                    )
+                    if cursor.rowcount > 0:
+                        # Insert regions if provided
+                        for region in svc.get("approved_regions", []):
+                            cursor.execute(
+                                "INSERT INTO service_approved_regions (service_id, region) VALUES (?, ?)",
+                                (svc["id"], region),
+                            )
+                        count += 1
+                except Exception:
+                    # Skip duplicates silently
+                    pass
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+
+    return await asyncio.get_event_loop().run_in_executor(None, _run)
+
+
+async def bulk_update_api_versions(
+    updates: list[dict],
+) -> int:
+    """Bulk-update latest_api_version and default_api_version on existing services.
+
+    Each dict in *updates* must have: id, latest_api_version, default_api_version.
+    Returns the number of rows actually updated.
+    """
+    if not updates:
+        return 0
+
+    import asyncio
+
+    backend = await get_backend()
+
+    def _run():
+        conn = backend._get_connection()
+        try:
+            cursor = conn.cursor()
+            count = 0
+            for rec in updates:
+                cursor.execute(
+                    """UPDATE services
+                       SET latest_api_version = ?, default_api_version = ?
+                       WHERE id = ?""",
+                    (
+                        rec.get("latest_api_version"),
+                        rec.get("default_api_version"),
+                        rec["id"],
+                    ),
+                )
+                if cursor.rowcount > 0:
+                    count += 1
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+
+    return await asyncio.get_event_loop().run_in_executor(None, _run)
+
+
+async def upsert_service(svc: dict) -> None:
+    """Insert or replace a service in the catalog."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        "DELETE FROM service_approved_skus WHERE service_id = ?", (svc["id"],))
+    await backend.execute_write(
+        "DELETE FROM service_approved_regions WHERE service_id = ?", (svc["id"],))
+    await backend.execute_write(
+        "DELETE FROM service_policies WHERE service_id = ?", (svc["id"],))
+    await backend.execute_write(
+        "DELETE FROM services WHERE id = ?", (svc["id"],))
+    await backend.execute_write(
+        """INSERT INTO services
+           (id, name, category, status, risk_tier, conditions_json,
+            review_notes, documentation, contact, rejection_reason,
+            approved_date, reviewed_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            svc["id"],
+            svc.get("name", ""),
+            svc.get("category", "other"),
+            svc.get("status", "not_approved"),
+            svc.get("risk_tier", "medium"),
+            json.dumps(svc.get("conditions", [])),
+            svc.get("review_notes", ""),
+            svc.get("documentation", ""),
+            svc.get("contact", ""),
+            svc.get("rejection_reason", ""),
+            svc.get("approved_date", ""),
+            svc.get("reviewed_by", ""),
+            now,
+            now,
+        ),
+    )
+    for sku in svc.get("approved_skus", []):
+        await backend.execute_write(
+            "INSERT INTO service_approved_skus (service_id, sku) VALUES (?, ?)",
+            (svc["id"], sku),
+        )
+    for region in svc.get("approved_regions", []):
+        await backend.execute_write(
+            "INSERT INTO service_approved_regions (service_id, region) VALUES (?, ?)",
+            (svc["id"], region),
+        )
+    for policy_text in svc.get("policies", []):
+        await backend.execute_write(
+            "INSERT INTO service_policies (service_id, policy_text) VALUES (?, ?)",
+            (svc["id"], policy_text),
+        )
+    invalidate_service_cache()
+
+
+# ── In-memory TTL cache for get_all_services ─────────────────
+_svc_cache: dict[str, tuple[float, list[dict]]] = {}
+_SVC_CACHE_TTL = 30  # seconds
+
+def invalidate_service_cache():
+    """Call after any write to services / service_approved_* / service_policies."""
+    _svc_cache.clear()
+
+
+async def update_service_status(service_id: str, status: str) -> bool:
+    """Update the top-level status of a service and invalidate the cache."""
+    backend = await get_backend()
+    count = await backend.execute_write(
+        "UPDATE services SET status = ? WHERE id = ?",
+        (status, service_id),
+    )
+    invalidate_service_cache()
+    return count > 0
+
+
+async def get_all_services(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+) -> list[dict]:
+    """Get all services from the catalog, hydrated with SKUs, regions, policies.
+
+    Uses batch queries (4 total) instead of per-service queries to avoid
+    N+1 performance issues — critical when thousands of services exist.
+    Results are cached for 30 seconds to avoid repeating heavy queries.
+    """
+    import time as _time
+    cache_key = f"{category or ''}|{status or ''}"
+    cached = _svc_cache.get(cache_key)
+    if cached:
+        ts, data = cached
+        if _time.monotonic() - ts < _SVC_CACHE_TTL:
+            return data
+
+    backend = await get_backend()
+
+    where_clauses: list[str] = []
+    params: list = []
+    if category:
+        where_clauses.append("s.category = ?")
+        params.append(category.lower())
+    if status:
+        where_clauses.append("s.status = ?")
+        params.append(status.lower())
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    # 1. Fetch all services (single query)
+    rows = await backend.execute(
+        f"SELECT * FROM services s {where_sql} ORDER BY s.category, s.name",
+        tuple(params),
+    )
+
+    if not rows:
+        return []
+
+    # 2. Batch-fetch ALL related data in 4 queries (not N+1)
+    all_skus = await backend.execute(
+        "SELECT service_id, sku FROM service_approved_skus", ())
+    all_regions = await backend.execute(
+        "SELECT service_id, region FROM service_approved_regions", ())
+    all_policies = await backend.execute(
+        "SELECT service_id, policy_text, security_standard_id "
+        "FROM service_policies WHERE enabled = 1", ())
+    all_artifacts = await backend.execute(
+        "SELECT service_id, artifact_type, status FROM service_artifacts", ())
+
+    # 2b. Batch-fetch semver for each service's active version
+    all_semvers = await backend.execute(
+        "SELECT sv.service_id, sv.semver FROM service_versions sv "
+        "INNER JOIN services s ON sv.service_id = s.id AND sv.version = s.active_version "
+        "WHERE sv.semver IS NOT NULL",
+        (),
+    )
+    semver_map: dict[str, str] = {r["service_id"]: r["semver"] for r in all_semvers}
+
+    # 2c. Batch-fetch latest (max) version int per service
+    all_max_ver = await backend.execute(
+        "SELECT service_id, MAX(version) AS max_ver FROM service_versions GROUP BY service_id",
+        (),
+    )
+    max_ver_map: dict[str, int] = {r["service_id"]: r["max_ver"] for r in all_max_ver}
+
+    # Group by service_id for O(1) lookup
+    from collections import defaultdict
+    skus_map: dict[str, list[str]] = defaultdict(list)
+    for r in all_skus:
+        skus_map[r["service_id"]].append(r["sku"])
+
+    regions_map: dict[str, list[str]] = defaultdict(list)
+    for r in all_regions:
+        regions_map[r["service_id"]].append(r["region"])
+
+    policies_map: dict[str, list[dict]] = defaultdict(list)
+    for p in all_policies:
+        policies_map[p["service_id"]].append(p)
+
+    artifacts_map: dict[str, dict[str, str]] = defaultdict(dict)
+    for a in all_artifacts:
+        artifacts_map[a["service_id"]][a["artifact_type"]] = a["status"]
+
+    # 3. Assemble hydrated results
+    result = []
+    for row in rows:
+        svc = dict(row)
+        svc_id = svc["id"]
+        svc["approved_skus"] = skus_map.get(svc_id, [])
+        svc["approved_regions"] = regions_map.get(svc_id, [])
+        svc_policies = policies_map.get(svc_id, [])
+        svc["policies"] = [p["policy_text"] for p in svc_policies]
+        svc["policy_standard_links"] = [
+            {"text": p["policy_text"], "standard_id": p["security_standard_id"]}
+            for p in svc_policies if p.get("security_standard_id")
+        ]
+        svc["conditions"] = json.loads(svc.pop("conditions_json", None) or "[]")
+
+        # Approval gate summary
+        svc_arts = artifacts_map.get(svc_id, {})
+        svc["gates"] = {
+            "policy": svc_arts.get("policy", "not_started"),
+            "template": svc_arts.get("template", "not_started"),
+        }
+        svc["gates_approved"] = sum(
+            1 for s in svc["gates"].values() if s == "approved"
+        )
+
+        # Semver for active version
+        svc["latest_semver"] = semver_map.get(svc_id)
+        svc["latest_version_int"] = max_ver_map.get(svc_id)
+
+        result.append(svc)
+
+    _svc_cache[cache_key] = (_time.monotonic(), result)
+    return result
+
+
+async def get_service(service_id: str) -> Optional[dict]:
+    """Get a single service by ID, fully hydrated."""
+    services = await get_all_services()
+    for svc in services:
+        if svc["id"] == service_id:
+            return svc
+    return None
+
+
+async def get_services_basic(service_ids: list[str]) -> dict[str, dict]:
+    """Get lightweight service info for a list of IDs.
+
+    Single SQL query, no hydration — much faster than get_all_services()
+    when you only need basic metadata.  Returns a dict keyed by service ID.
+    """
+    if not service_ids:
+        return {}
+    backend = await get_backend()
+    placeholders = ", ".join("?" for _ in service_ids)
+    rows = await backend.execute(
+        f"SELECT id, name, category, status, reviewed_by, latest_api_version, template_api_version FROM services WHERE id IN ({placeholders})",
+        tuple(service_ids),
+    )
+    return {r["id"]: dict(r) for r in rows}
+
+
+# ══════════════════════════════════════════════════════════════
+# TEMPLATE CATALOG CRUD
+# ══════════════════════════════════════════════════════════════
+
+async def upsert_template(tmpl: dict) -> None:
+    """Insert or update a catalog template, preserving active_version."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Compliance profile: None = not configured, [] = exempt, [...] = specific
+    cp = tmpl.get("compliance_profile")
+    cp_json = json.dumps(cp) if cp is not None else None
+
+    existing = await backend.execute(
+        "SELECT id FROM catalog_templates WHERE id = ?", (tmpl["id"],)
+    )
+
+    if existing:
+        # UPDATE — preserve active_version and created_at
+        await backend.execute_write(
+            """
+            UPDATE catalog_templates SET
+                name = ?, description = ?, format = ?, category = ?,
+                source_path = ?, content = ?,
+                tags_json = ?, resources_json = ?, parameters_json = ?,
+                outputs_json = ?, service_ids_json = ?, is_blueprint = ?,
+                registered_by = ?, status = ?,
+                template_type = ?, provides_json = ?, requires_json = ?,
+                optional_refs_json = ?, compliance_profile_json = ?,
+                pinned_versions_json = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                tmpl.get("name", ""),
+                tmpl.get("description", ""),
+                tmpl.get("format", "bicep"),
+                tmpl.get("category", "compute"),
+                tmpl.get("source_path", ""),
+                tmpl.get("content", ""),
+                json.dumps(tmpl.get("tags", [])),
+                json.dumps(tmpl.get("resources", [])),
+                json.dumps(tmpl.get("parameters", [])),
+                json.dumps(tmpl.get("outputs", [])),
+                json.dumps(tmpl.get("service_ids", tmpl.get("composedOf", []))),
+                1 if tmpl.get("is_blueprint", tmpl.get("category") == "blueprint") else 0,
+                tmpl.get("registered_by", "platform-team"),
+                tmpl.get("status", "draft"),
+                tmpl.get("template_type", "workload"),
+                json.dumps(tmpl.get("provides", [])),
+                json.dumps(tmpl.get("requires", [])),
+                json.dumps(tmpl.get("optional_refs", [])),
+                cp_json,
+                json.dumps(tmpl.get("pinned_versions")) if tmpl.get("pinned_versions") else None,
+                now,
+                tmpl["id"],
+            ),
+        )
+    else:
+        # INSERT — new template
+        await backend.execute_write(
+            """
+            INSERT INTO catalog_templates
+                (id, name, description, format, category, source_path, content,
+                 tags_json, resources_json, parameters_json, outputs_json,
+                 service_ids_json, is_blueprint, registered_by, status,
+                 template_type, provides_json, requires_json, optional_refs_json,
+                 compliance_profile_json, pinned_versions_json,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tmpl["id"],
+                tmpl.get("name", ""),
+                tmpl.get("description", ""),
+                tmpl.get("format", "bicep"),
+                tmpl.get("category", "compute"),
+                tmpl.get("source_path", ""),
+                tmpl.get("content", ""),
+                json.dumps(tmpl.get("tags", [])),
+                json.dumps(tmpl.get("resources", [])),
+                json.dumps(tmpl.get("parameters", [])),
+                json.dumps(tmpl.get("outputs", [])),
+                json.dumps(tmpl.get("service_ids", tmpl.get("composedOf", []))),
+                1 if tmpl.get("is_blueprint", tmpl.get("category") == "blueprint") else 0,
+                tmpl.get("registered_by", "platform-team"),
+                tmpl.get("status", "draft"),
+                tmpl.get("template_type", "workload"),
+                json.dumps(tmpl.get("provides", [])),
+                json.dumps(tmpl.get("requires", [])),
+                json.dumps(tmpl.get("optional_refs", [])),
+                cp_json,
+                json.dumps(tmpl.get("pinned_versions")) if tmpl.get("pinned_versions") else None,
+                now,
+                now,
+            ),
+        )
+
+
+async def update_template_pinned_versions(
+    template_id: str, pinned_versions: dict
+) -> bool:
+    """Update only the pinned_versions_json column on a catalog template.
+
+    Returns True if the template was found and updated.
+    """
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT id FROM catalog_templates WHERE id = ?", (template_id,)
+    )
+    if not rows:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        "UPDATE catalog_templates SET pinned_versions_json = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(pinned_versions), now, template_id),
+    )
+    return True
+
+
+async def get_all_templates(
+    category: Optional[str] = None,
+    fmt: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    template_type: Optional[str] = None,
+) -> list[dict]:
+    """Get all catalog templates with optional filters."""
+    backend = await get_backend()
+
+    where_clauses: list[str] = []
+    params: list = []
+    if category:
+        where_clauses.append("category = ?")
+        params.append(category.lower())
+    if fmt:
+        where_clauses.append("format = ?")
+        params.append(fmt.lower())
+    if status:
+        where_clauses.append("status = ?")
+        params.append(status.lower())
+    if template_type:
+        where_clauses.append("template_type = ?")
+        params.append(template_type.lower())
+    if search:
+        where_clauses.append(
+            "(LOWER(name) LIKE ? OR LOWER(description) LIKE ? OR tags_json LIKE ?)"
+        )
+        like = f"%{search.lower()}%"
+        params.extend([like, like, like])
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    rows = await backend.execute(
+        f"SELECT * FROM catalog_templates {where_sql} ORDER BY category, name",
+        tuple(params),
+    )
+
+    result = []
+    for row in rows:
+        t = dict(row)
+        t["tags"] = json.loads(t.pop("tags_json", None) or "[]")
+        t["resources"] = json.loads(t.pop("resources_json", None) or "[]")
+        t["parameters"] = json.loads(t.pop("parameters_json", None) or "[]")
+        t["outputs"] = json.loads(t.pop("outputs_json", None) or "[]")
+        t["service_ids"] = json.loads(t.pop("service_ids_json", None) or "[]")
+        t["is_blueprint"] = bool(t.get("is_blueprint"))
+        # Pinned service versions (compose-time snapshot)
+        _pv_raw = t.pop("pinned_versions_json", None)
+        t["pinned_versions"] = json.loads(_pv_raw) if _pv_raw else {}
+        # Dependency metadata
+        t["provides"] = json.loads(t.pop("provides_json", None) or "[]")
+        t["requires"] = json.loads(t.pop("requires_json", None) or "[]")
+        t["optional_refs"] = json.loads(t.pop("optional_refs_json", None) or "[]")
+        # Compliance profile: None = not configured, list = specific categories
+        _cp_raw = t.pop("compliance_profile_json", None)
+        t["compliance_profile"] = json.loads(_cp_raw) if _cp_raw else None
+        t.setdefault("template_type", "workload")
+        # Rename source_path back to 'source' for compatibility
+        t["source"] = t.pop("source_path", "")
+        result.append(t)
+    return result
+
+
+def _parse_template_row(row: dict) -> dict:
+    """Parse a raw catalog_templates DB row into a hydrated dict."""
+    t = dict(row)
+    t["tags"] = json.loads(t.pop("tags_json", "[]") or "[]")
+    t["resources"] = json.loads(t.pop("resources_json", "[]") or "[]")
+    t["parameters"] = json.loads(t.pop("parameters_json", "[]") or "[]")
+    t["outputs"] = json.loads(t.pop("outputs_json", "[]") or "[]")
+    t["service_ids"] = json.loads(t.pop("service_ids_json", "[]") or "[]")
+    t["is_blueprint"] = bool(t.get("is_blueprint"))
+    _pv_raw = t.pop("pinned_versions_json", None)
+    t["pinned_versions"] = json.loads(_pv_raw) if _pv_raw else {}
+    t["provides"] = json.loads(t.pop("provides_json", None) or "[]")
+    t["requires"] = json.loads(t.pop("requires_json", None) or "[]")
+    t["optional_refs"] = json.loads(t.pop("optional_refs_json", None) or "[]")
+    _cp_raw = t.pop("compliance_profile_json", None)
+    t["compliance_profile"] = json.loads(_cp_raw) if _cp_raw else None
+    t.setdefault("template_type", "workload")
+    t["source"] = t.pop("source_path", "")
+    return t
+
+
+async def get_template_by_id(template_id: str) -> Optional[dict]:
+    """Get a single template by ID."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM catalog_templates WHERE id = ?", (template_id,)
+    )
+    if not rows:
+        return None
+    return _parse_template_row(rows[0])
+
+
+async def delete_template(template_id: str) -> bool:
+    """Delete a template by ID. Returns True if deleted."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT id FROM catalog_templates WHERE id = ?", (template_id,)
+    )
+    if not rows:
+        return False
+    await backend.execute_write(
+        "DELETE FROM template_versions WHERE template_id = ?", (template_id,)
+    )
+    await backend.execute_write(
+        "DELETE FROM catalog_templates WHERE id = ?", (template_id,)
+    )
+    return True
+
+
+# ══════════════════════════════════════════════════════════════
+# TEMPLATE VERSIONS
+# ══════════════════════════════════════════════════════════════
+
+
+def compute_next_semver(
+    current_semver: Optional[str],
+    change_type: str = "minor",
+) -> str:
+    """Compute the next semantic version based on change type.
+
+    change_type values:
+        "major"  — breaking / full recompose  (1.0.0 → 2.0.0)
+        "minor"  — revision / feature change  (1.0.0 → 1.1.0)
+        "patch"  — auto-heal / bugfix         (1.0.0 → 1.0.1)
+        "initial" — first version             (always 1.0.0)
+    """
+    if change_type == "initial":
+        return "1.0.0"
+
+    # When no prior version exists, assume 1.0.0 as the base so that
+    # non-initial bumps increment correctly (e.g. patch → 1.0.1).
+    if not current_semver:
+        current_semver = "1.0.0"
+
+    parts = current_semver.split(".")
+    try:
+        major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+    except (IndexError, ValueError):
+        return "1.0.0"
+
+    if change_type == "major":
+        return f"{major + 1}.0.0"
+    elif change_type == "minor":
+        return f"{major}.{minor + 1}.0"
+    elif change_type == "patch":
+        return f"{major}.{minor}.{patch + 1}"
+    return f"{major}.{minor + 1}.0"
+
+
+async def get_latest_semver(template_id: str) -> Optional[str]:
+    """Get the latest semver for a template from its version history."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        """SELECT TOP 1 semver FROM template_versions
+           WHERE template_id = ? AND semver IS NOT NULL
+             AND status = 'approved'
+           ORDER BY version DESC""",
+        (template_id,),
+    )
+    if rows and rows[0]["semver"]:
+        return rows[0]["semver"]
+    return None
+
+
+async def create_template_version(
+    template_id: str,
+    arm_template: str,
+    *,
+    changelog: str = "",
+    semver: Optional[str] = None,
+    change_type: str = "minor",
+    created_by: str = "template-composer",
+) -> dict:
+    """Create a new version of a template. Auto-increments version number.
+
+    If semver is not provided, it is auto-computed from the latest version
+    using change_type: "initial", "major", "minor", or "patch".
+    """
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Determine next version number
+    rows = await backend.execute(
+        "SELECT COALESCE(MAX(version), 0) AS max_ver FROM template_versions WHERE template_id = ?",
+        (template_id,),
+    )
+    next_ver = (rows[0]["max_ver"] if rows else 0) + 1
+
+    # Auto-compute semver if not explicitly provided
+    if not semver:
+        current_semver = await get_latest_semver(template_id)
+        semver = compute_next_semver(current_semver, change_type)
+
+    # Sync the ARM template's contentVersion with our semver
+    try:
+        _tpl = json.loads(arm_template)
+        if isinstance(_tpl, dict) and _tpl.get("contentVersion") != semver:
+            _tpl["contentVersion"] = semver
+            arm_template = json.dumps(_tpl, indent=2)
+    except (json.JSONDecodeError, TypeError):
+        pass  # not valid JSON — leave as-is
+
+    await backend.execute_write(
+        """
+        INSERT INTO template_versions
+            (template_id, version, arm_template, status, test_results_json,
+             changelog, semver, created_by, created_at)
+        VALUES (?, ?, ?, 'draft', '{}', ?, ?, ?, ?)
+        """,
+        (template_id, next_ver, arm_template, changelog, semver, created_by, now),
+    )
+
+    return {
+        "template_id": template_id,
+        "version": next_ver,
+        "status": "draft",
+        "semver": semver,
+        "changelog": changelog,
+        "created_by": created_by,
+        "created_at": now,
+    }
+
+
+async def get_template_versions(template_id: str) -> list[dict]:
+    """Get all versions for a template, ordered by version descending."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        """SELECT * FROM template_versions
+           WHERE template_id = ?
+           ORDER BY version DESC""",
+        (template_id,),
+    )
+    result = []
+    for row in rows:
+        v = dict(row)
+        v["test_results"] = json.loads(v.pop("test_results_json", "{}") or "{}")
+        v["validation_results"] = json.loads(v.pop("validation_results_json", None) or "{}")
+        result.append(v)
+    return result
+
+
+async def get_template_version(template_id: str, version: int) -> Optional[dict]:
+    """Get a specific version of a template."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM template_versions WHERE template_id = ? AND version = ?",
+        (template_id, version),
+    )
+    if not rows:
+        return None
+    v = dict(rows[0])
+    v["test_results"] = json.loads(v.pop("test_results_json", "{}") or "{}")
+    v["validation_results"] = json.loads(v.pop("validation_results_json", None) or "{}")
+    return v
+
+
+async def update_template_version_status(
+    template_id: str,
+    version: int,
+    status: str,
+    test_results: Optional[dict] = None,
+) -> bool:
+    """Update a template version's status and optionally its test results."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    if test_results is not None:
+        await backend.execute_write(
+            """UPDATE template_versions
+               SET status = ?, test_results_json = ?, tested_at = ?
+               WHERE template_id = ? AND version = ?""",
+            (status, json.dumps(test_results), now, template_id, version),
+        )
+    else:
+        await backend.execute_write(
+            """UPDATE template_versions
+               SET status = ?
+               WHERE template_id = ? AND version = ?""",
+            (status, template_id, version),
+        )
+    return True
+
+
+async def update_template_validation_status(
+    template_id: str,
+    version: int,
+    status: str,
+    validation_results: Optional[dict] = None,
+) -> bool:
+    """Update a template version's validation (ARM What-If) results."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    await backend.execute_write(
+        """UPDATE template_versions
+           SET status = ?, validation_results_json = ?, validated_at = ?
+           WHERE template_id = ? AND version = ?""",
+        (status, json.dumps(validation_results or {}), now, template_id, version),
+    )
+    return True
+
+
+async def promote_template_version(template_id: str, version: int) -> bool:
+    """Promote a validated template version to active, update parent template."""
+    backend = await get_backend()
+
+    # Verify the version exists and has been validated (ARM What-If passed)
+    rows = await backend.execute(
+        "SELECT status FROM template_versions WHERE template_id = ? AND version = ?",
+        (template_id, version),
+    )
+    if not rows:
+        return False
+    if rows[0]["status"] not in ("validated", "passed"):
+        return False
+
+    # Mark this version as approved, un-approve others
+    await backend.execute_write(
+        """UPDATE template_versions SET status = 'superseded'
+           WHERE template_id = ? AND status = 'approved' AND version <> ?""",
+        (template_id, version),
+    )
+    await backend.execute_write(
+        """UPDATE template_versions SET status = 'approved'
+           WHERE template_id = ? AND version = ?""",
+        (template_id, version),
+    )
+
+    # Update parent template's active_version and status
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """UPDATE catalog_templates
+           SET active_version = ?, status = 'approved', updated_at = ?
+           WHERE id = ?""",
+        (version, now, template_id),
+    )
+    return True
+
+
+# ══════════════════════════════════════════════════════════════
+# DEPLOYMENTS
+# ══════════════════════════════════════════════════════════════
+
+async def save_deployment(deployment: dict) -> None:
+    """Insert or update a deployment record."""
+    backend = await get_backend()
+    # Upsert: delete then insert
+    await backend.execute_write(
+        "DELETE FROM deployments WHERE deployment_id = ?",
+        (deployment["deployment_id"],),
+    )
+    await backend.execute_write(
+        """INSERT INTO deployments
+           (deployment_id, deployment_name, resource_group, region,
+            status, phase, progress, detail, template_hash,
+            initiated_by, started_at, completed_at, error,
+            resources_json, what_if_json, outputs_json,
+            template_id, template_name, subscription_id,
+            template_version, template_semver)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            deployment["deployment_id"],
+            deployment["deployment_name"],
+            deployment["resource_group"],
+            deployment["region"],
+            deployment.get("status", "pending"),
+            deployment.get("phase", "init"),
+            deployment.get("progress", 0.0),
+            deployment.get("detail", ""),
+            deployment.get("template_hash", ""),
+            deployment.get("initiated_by", "agent"),
+            deployment["started_at"],
+            deployment.get("completed_at"),
+            deployment.get("error"),
+            json.dumps(deployment.get("provisioned_resources", [])),
+            json.dumps(deployment.get("what_if_results")),
+            json.dumps(deployment.get("outputs", {})),
+            deployment.get("template_id", ""),
+            deployment.get("template_name", ""),
+            deployment.get("subscription_id", ""),
+            deployment.get("template_version", 0),
+            deployment.get("template_semver", ""),
+        ),
+    )
+
+
+async def get_deployments(
+    status: Optional[str] = None,
+    resource_group: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List deployment records from the database."""
+    backend = await get_backend()
+    where_clauses: list[str] = []
+    params: list = []
+
+    if status:
+        where_clauses.append("status = ?")
+        params.append(status)
+    if resource_group:
+        where_clauses.append("resource_group = ?")
+        params.append(resource_group)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    rows = await backend.execute(
+        f"SELECT * FROM deployments {where_sql} ORDER BY started_at DESC",
+        tuple(params),
+    )
+
+    result = []
+    for row in rows[:limit]:
+        d = dict(row)
+        d["provisioned_resources"] = json.loads(d.pop("resources_json", None) or "[]")
+        d["what_if_results"] = json.loads(d.pop("what_if_json", None) or "null")
+        d["outputs"] = json.loads(d.pop("outputs_json", None) or "{}")
+        d.setdefault("template_id", "")
+        d.setdefault("template_name", "")
+        d.setdefault("subscription_id", "")
+        d.setdefault("torn_down_at", None)
+        d.setdefault("template_version", 0)
+        d.setdefault("template_semver", "")
+        result.append(d)
+    return result
+
+
+async def get_deployment(deployment_id: str) -> Optional[dict]:
+    """Get a single deployment by ID."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM deployments WHERE deployment_id = ?",
+        (deployment_id,),
+    )
+    if not rows:
+        return None
+    d = dict(rows[0])
+    d["provisioned_resources"] = json.loads(d.pop("resources_json", None) or "[]")
+    d["what_if_results"] = json.loads(d.pop("what_if_json", None) or "null")
+    d["outputs"] = json.loads(d.pop("outputs_json", None) or "{}")
+    d.setdefault("template_id", "")
+    d.setdefault("template_name", "")
+    d.setdefault("subscription_id", "")
+    d.setdefault("torn_down_at", None)
+    return d
+
+
+async def update_deployment_status(
+    deployment_id: str,
+    status: str,
+    torn_down_at: Optional[str] = None,
+) -> bool:
+    """Update a deployment's status (e.g. to 'torn_down')."""
+    backend = await get_backend()
+    if torn_down_at:
+        await backend.execute_write(
+            "UPDATE deployments SET status = ?, torn_down_at = ? WHERE deployment_id = ?",
+            (status, torn_down_at, deployment_id),
+        )
+    else:
+        await backend.execute_write(
+            "UPDATE deployments SET status = ? WHERE deployment_id = ?",
+            (status, deployment_id),
+        )
+    return True
+
+
+# ══════════════════════════════════════════════════════════════
+# SERVICE APPROVAL ARTIFACTS (2-Gate Workflow)
+# ══════════════════════════════════════════════════════════════
+
+ARTIFACT_TYPES = ("policy", "template")
+
+
+async def save_service_artifact(
+    service_id: str,
+    artifact_type: str,
+    content: str = "",
+    status: str = "draft",
+    notes: str = "",
+    approved_by: Optional[str] = None,
+) -> dict:
+    """Save or update a service approval artifact (policy or template).
+
+    When status is set to 'approved', the approved_at timestamp is recorded.
+    After every save, auto-promotion is checked — if all 2 gates are approved
+    the service itself is promoted to 'approved'.
+    """
+    if artifact_type not in ARTIFACT_TYPES:
+        raise ValueError(f"artifact_type must be one of {ARTIFACT_TYPES}")
+
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    artifact_id = f"{service_id}:{artifact_type}"
+
+    existing = await backend.execute(
+        "SELECT id FROM service_artifacts WHERE id = ?", (artifact_id,)
+    )
+
+    if existing:
+        await backend.execute_write(
+            """UPDATE service_artifacts
+               SET content = ?, status = ?, notes = ?, approved_by = ?,
+                   approved_at = CASE WHEN ? = 'approved' THEN ? ELSE approved_at END,
+                   updated_at = ?
+               WHERE id = ?""",
+            (content, status, notes, approved_by,
+             status, now, now, artifact_id),
+        )
+    else:
+        await backend.execute_write(
+            """INSERT INTO service_artifacts
+               (id, service_id, artifact_type, status, content, notes,
+                approved_by, approved_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (artifact_id, service_id, artifact_type, status, content, notes,
+             approved_by, now if status == "approved" else None, now, now),
+        )
+
+    # Check if all 2 gates are approved → auto-promote service
+    await _check_and_promote_service(service_id)
+
+    return await get_service_artifact(service_id, artifact_type)
+
+
+async def get_service_artifact(
+    service_id: str,
+    artifact_type: str,
+) -> Optional[dict]:
+    """Get a specific artifact for a service."""
+    backend = await get_backend()
+    artifact_id = f"{service_id}:{artifact_type}"
+    rows = await backend.execute(
+        "SELECT * FROM service_artifacts WHERE id = ?", (artifact_id,)
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def get_service_artifacts(service_id: str) -> dict:
+    """Get all artifact gates for a service.
+
+    Returns a dict with keys: policy, template, _summary.
+    Each artifact value is either the DB record or a 'not_started' placeholder.
+    """
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM service_artifacts WHERE service_id = ? ORDER BY artifact_type",
+        (service_id,),
+    )
+
+    artifacts_by_type = {row["artifact_type"]: dict(row) for row in rows}
+
+    result = {}
+    for atype in ARTIFACT_TYPES:
+        if atype in artifacts_by_type:
+            result[atype] = artifacts_by_type[atype]
+        else:
+            result[atype] = {
+                "id": f"{service_id}:{atype}",
+                "service_id": service_id,
+                "artifact_type": atype,
+                "status": "not_started",
+                "content": "",
+                "notes": "",
+                "approved_by": None,
+                "approved_at": None,
+            }
+
+    approved_count = sum(1 for a in result.values() if a.get("status") == "approved")
+    result["_summary"] = {
+        "approved_count": approved_count,
+        "total_gates": 2,
+        "all_approved": approved_count == 2,
+    }
+    return result
+
+
+async def approve_service_artifact(
+    service_id: str,
+    artifact_type: str,
+    approved_by: str = "IT Staff",
+) -> dict:
+    """Mark an artifact as approved. Artifact must have content (draft status)."""
+    artifact = await get_service_artifact(service_id, artifact_type)
+    if not artifact or artifact["status"] == "not_started":
+        raise ValueError("Cannot approve artifact without content. Save a draft first.")
+
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    artifact_id = f"{service_id}:{artifact_type}"
+
+    await backend.execute_write(
+        """UPDATE service_artifacts
+           SET status = 'approved', approved_by = ?, approved_at = ?, updated_at = ?
+           WHERE id = ?""",
+        (approved_by, now, now, artifact_id),
+    )
+
+    await _check_and_promote_service(service_id)
+    return await get_service_artifact(service_id, artifact_type)
+
+
+async def unapprove_service_artifact(
+    service_id: str,
+    artifact_type: str,
+) -> dict:
+    """Revert an artifact back to draft status (e.g. for edits)."""
+    backend = await get_backend()
+    artifact_id = f"{service_id}:{artifact_type}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    await backend.execute_write(
+        """UPDATE service_artifacts
+           SET status = 'draft', approved_by = NULL, approved_at = NULL, updated_at = ?
+           WHERE id = ?""",
+        (now, artifact_id),
+    )
+
+    await _check_and_promote_service(service_id)
+    return await get_service_artifact(service_id, artifact_type)
+
+
+async def _check_and_promote_service(service_id: str) -> str:
+    """Check gate status and update service lifecycle state.
+
+    Lifecycle: not_approved → validating (2/2 gates) → approved (deploy test passes)
+
+    When both gates are approved, sets the service to 'validating' — the caller
+    is responsible for triggering the deployment test.  Only
+    promote_service_after_validation() sets status to 'approved'.
+
+    Returns the resulting status: 'not_approved', 'validating', or 'approved'.
+    """
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT COUNT(*) as cnt FROM service_artifacts "
+        "WHERE service_id = ? AND status = 'approved'",
+        (service_id,),
+    )
+
+    approved_count = rows[0]["cnt"] if rows else 0
+
+    if approved_count >= 2:
+        # Both gates approved — move to 'validating' (not directly to 'approved')
+        now = datetime.now(timezone.utc).isoformat()
+        await backend.execute_write(
+            """UPDATE services
+               SET status = 'validating', approved_date = NULL,
+                   reviewed_by = NULL
+               WHERE id = ? AND status NOT IN ('validating', 'approved')""",
+            (service_id,),
+        )
+        logger.info(
+            f"Service {service_id} moved to 'validating' (both gates passed, awaiting deployment test)"
+        )
+        return "validating"
+    else:
+        # Demote if a gate was reverted
+        await backend.execute_write(
+            """UPDATE services SET status = 'not_approved'
+               WHERE id = ? AND status IN ('approved', 'validating')
+               AND reviewed_by IN ('Deployment Validated', 'Two-Gate Approval', 'Three-Gate Approval', NULL, '')""",
+            (service_id,),
+        )
+        return "not_approved"
+
+
+async def promote_service_after_validation(
+    service_id: str,
+    validation_result: dict,
+) -> bool:
+    """Promote a service to 'approved' after successful deployment validation.
+
+    Called only when the deployment test (What-If + validation) passes.
+    """
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Save validation result as a note on the service
+    notes = json.dumps({
+        "validation_passed": True,
+        "validated_at": now,
+        "what_if_summary": validation_result.get("change_counts", {}),
+        "total_changes": validation_result.get("total_changes", 0),
+    })
+
+    await backend.execute_write(
+        """UPDATE services
+           SET status = 'approved', approved_date = ?,
+               reviewed_by = 'Deployment Validated',
+               review_notes = ?
+           WHERE id = ?""",
+        (now, notes, service_id),
+    )
+    logger.info(f"Service {service_id} promoted to 'approved' after deployment validation")
+    invalidate_service_cache()
+    return True
+
+
+async def fail_service_validation(
+    service_id: str,
+    error: str,
+) -> bool:
+    """Mark a service as failed validation.
+
+    If the service already has an active (approved) version, we keep
+    the service status as 'approved' — a failed re-onboarding attempt
+    should NOT demote a service that already has a working version.
+    Only services without an active version get set to 'validation_failed'.
+    """
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    notes = json.dumps({
+        "validation_passed": False,
+        "validated_at": now,
+        "error": error,
+    })
+
+    # Guard: don't demote a service that already has an active version
+    rows = await backend.execute(
+        "SELECT active_version, status FROM services WHERE id = ?",
+        (service_id,),
+    )
+    has_active = rows and rows[0].get("active_version") is not None
+
+    if has_active:
+        # Preserve status — only update review_notes so the error is recorded
+        await backend.execute_write(
+            """UPDATE services
+               SET review_notes = ?
+               WHERE id = ?""",
+            (notes, service_id),
+        )
+        logger.info(f"Service {service_id} failed validation but has active version — status preserved: {error}")
+    else:
+        await backend.execute_write(
+            """UPDATE services
+               SET status = 'validation_failed',
+                   review_notes = ?
+               WHERE id = ?""",
+            (notes, service_id),
+        )
+        logger.info(f"Service {service_id} failed deployment validation: {error}")
+    invalidate_service_cache()
+    return True
+
+
+# ══════════════════════════════════════════════════════════════
+# SERVICE VERSIONS (Versioned ARM Templates)
+# ══════════════════════════════════════════════════════════════
+
+
+async def create_service_version(
+    service_id: str,
+    arm_template: str,
+    version: int | None = None,
+    semver: str | None = None,
+    status: str = "draft",
+    changelog: str = "",
+    created_by: str = "auto-generated",
+) -> dict:
+    """Create a new version of a service's ARM template.
+
+    If version is None, automatically increments from the latest version.
+    If semver is None, auto-computed as ``{version}.0.0``.
+
+    Automatically strips foreign resources — only the service's own resource
+    type is kept. Dependencies are handled by the composition layer.
+
+    Returns the created version record.
+    """
+    # Strip foreign resources before storing
+    from src.tools.arm_generator import strip_foreign_resources
+    arm_template = strip_foreign_resources(arm_template, service_id)
+
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    if version is None:
+        rows = await backend.execute(
+            "SELECT MAX(version) as max_ver FROM service_versions WHERE service_id = ?",
+            (service_id,),
+        )
+        current_max = rows[0]["max_ver"] if rows and rows[0]["max_ver"] else 0
+        version = current_max + 1
+
+    if semver is None:
+        semver = f"{version}.0.0"
+
+    # Sync the ARM template's contentVersion with our semver
+    try:
+        _tpl = json.loads(arm_template)
+        if isinstance(_tpl, dict) and _tpl.get("contentVersion") != semver:
+            _tpl["contentVersion"] = semver
+            arm_template = json.dumps(_tpl, indent=2)
+    except (json.JSONDecodeError, TypeError):
+        pass  # not valid JSON — leave as-is
+
+    await backend.execute_write(
+        """INSERT INTO service_versions
+           (service_id, version, semver, arm_template, status, changelog,
+            created_by, created_at, validation_result_json, policy_check_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}')""",
+        (service_id, version, semver, arm_template, status, changelog, created_by, now),
+    )
+
+    logger.info(f"Created service version {service_id} v{semver} ({status})")
+    return await get_service_version(service_id, version)
+
+
+async def get_service_version(service_id: str, version: int) -> dict | None:
+    """Get a specific version of a service's ARM template."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM service_versions WHERE service_id = ? AND version = ?",
+        (service_id, version),
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    vr_json = row.pop("validation_result_json", None) or "{}"
+    pc_json = row.pop("policy_check_json", None) or "{}"
+    row["validation_result"] = json.loads(vr_json)
+    row["policy_check"] = json.loads(pc_json)
+    return row
+
+
+async def get_service_versions(
+    service_id: str,
+    status: str | None = None,
+) -> list[dict]:
+    """Get all versions of a service, ordered by version descending."""
+    backend = await get_backend()
+    if status:
+        rows = await backend.execute(
+            "SELECT * FROM service_versions WHERE service_id = ? AND status = ? ORDER BY version DESC",
+            (service_id, status),
+        )
+    else:
+        rows = await backend.execute(
+            "SELECT * FROM service_versions WHERE service_id = ? ORDER BY version DESC",
+            (service_id,),
+        )
+    result = []
+    for row in rows:
+        d = dict(row)
+        # Handle NULL values from Azure SQL — pop returns None if key exists but value is NULL
+        vr_json = d.pop("validation_result_json", None) or "{}"
+        pc_json = d.pop("policy_check_json", None) or "{}"
+        d["validation_result"] = json.loads(vr_json)
+        d["policy_check"] = json.loads(pc_json)
+        # Parse azure_policy_json if present
+        ap_json = d.pop("azure_policy_json", None)
+        d["azure_policy"] = json.loads(ap_json) if ap_json else None
+        result.append(d)
+    return result
+
+
+async def get_latest_service_version(service_id: str) -> dict | None:
+    """Get the latest version (by version number) for a service."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT TOP 1 * FROM service_versions WHERE service_id = ? ORDER BY version DESC",
+        (service_id,),
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    vr_json = row.pop("validation_result_json", None) or "{}"
+    pc_json = row.pop("policy_check_json", None) or "{}"
+    row["validation_result"] = json.loads(vr_json)
+    row["policy_check"] = json.loads(pc_json)
+    return row
+
+
+async def update_service_version_status(
+    service_id: str,
+    version: int,
+    status: str,
+    validation_result: dict | None = None,
+    policy_check: dict | None = None,
+    azure_policy_json: dict | None = None,
+) -> bool:
+    """Update the status and validation results of a service version."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    set_clauses = ["status = ?"]
+    params: list = [status]
+
+    if validation_result is not None:
+        set_clauses.append("validation_result_json = ?")
+        params.append(json.dumps(validation_result))
+
+    if policy_check is not None:
+        set_clauses.append("policy_check_json = ?")
+        params.append(json.dumps(policy_check))
+
+    if azure_policy_json is not None:
+        set_clauses.append("azure_policy_json = ?")
+        params.append(json.dumps(azure_policy_json))
+
+    if status in ("approved", "failed"):
+        set_clauses.append("validated_at = ?")
+        params.append(now)
+
+    params.extend([service_id, version])
+
+    count = await backend.execute_write(
+        f"UPDATE service_versions SET {', '.join(set_clauses)} "
+        f"WHERE service_id = ? AND version = ?",
+        tuple(params),
+    )
+    return count > 0
+
+
+async def update_service_version_template(
+    service_id: str,
+    version: int,
+    arm_template: str,
+    created_by: str = "copilot-healed",
+) -> bool:
+    """Update the ARM template content for a version (used by auto-healing).
+
+    Automatically strips foreign resources — only the service's own resource
+    type is kept. Dependencies are handled by the composition layer.
+    """
+    from src.tools.arm_generator import strip_foreign_resources
+    arm_template = strip_foreign_resources(arm_template, service_id)
+
+    backend = await get_backend()
+    count = await backend.execute_write(
+        "UPDATE service_versions SET arm_template = ?, created_by = ? "
+        "WHERE service_id = ? AND version = ?",
+        (arm_template, created_by, service_id, version),
+    )
+    return count > 0
+
+
+async def update_service_version_deployment_info(
+    service_id: str,
+    version: int,
+    *,
+    run_id: str | None = None,
+    resource_group: str | None = None,
+    deployment_name: str | None = None,
+    subscription_id: str | None = None,
+) -> bool:
+    """Persist Azure deployment tracking info on a service version."""
+    backend = await get_backend()
+    set_clauses = []
+    params: list = []
+    if run_id is not None:
+        set_clauses.append("run_id = ?")
+        params.append(run_id)
+    if resource_group is not None:
+        set_clauses.append("resource_group = ?")
+        params.append(resource_group)
+    if deployment_name is not None:
+        set_clauses.append("deployment_name = ?")
+        params.append(deployment_name)
+    if subscription_id is not None:
+        set_clauses.append("subscription_id = ?")
+        params.append(subscription_id)
+    if not set_clauses:
+        return False
+    params.extend([service_id, version])
+    count = await backend.execute_write(
+        f"UPDATE service_versions SET {', '.join(set_clauses)} "
+        f"WHERE service_id = ? AND version = ?",
+        tuple(params),
+    )
+    return count > 0
+
+
+async def update_service_version_policy(
+    service_id: str,
+    version: int,
+    azure_policy_json: dict,
+) -> bool:
+    """Save or replace the Azure Policy JSON on a service version."""
+    backend = await get_backend()
+    count = await backend.execute_write(
+        "UPDATE service_versions SET azure_policy_json = ? "
+        "WHERE service_id = ? AND version = ?",
+        (json.dumps(azure_policy_json), service_id, version),
+    )
+    return count > 0
+
+
+async def delete_service_versions_by_status(
+    service_id: str,
+    statuses: list[str],
+    *,
+    keep_version: int | None = None,
+) -> int:
+    """Delete service versions matching any of the given statuses.
+
+    Useful for cleaning up leftover draft/failed versions before a new pipeline run.
+    Never deletes the active version.  If *keep_version* is given, that version
+    is also excluded from deletion.
+    """
+    backend = await get_backend()
+    placeholders = ", ".join("?" for _ in statuses)
+    params: list = [service_id] + statuses
+
+    extra = ""
+    if keep_version is not None:
+        extra += " AND version <> ?"
+        params.append(keep_version)
+
+    # Safety: don't delete the active version
+    svc_rows = await backend.execute(
+        "SELECT active_version FROM services WHERE id = ?", (service_id,)
+    )
+    active_ver = svc_rows[0]["active_version"] if svc_rows and svc_rows[0].get("active_version") else None
+    if active_ver is not None:
+        extra += " AND version <> ?"
+        params.append(active_ver)
+
+    count = await backend.execute_write(
+        f"DELETE FROM service_versions WHERE service_id = ? AND status IN ({placeholders}){extra}",
+        tuple(params),
+    )
+    if count:
+        logger.info(f"Deleted {count} version(s) for {service_id} with status in {statuses}")
+    return count
+
+
+async def delete_template_versions_by_status(
+    template_id: str,
+    statuses: list[str],
+    *,
+    keep_version: int | None = None,
+) -> int:
+    """Delete template versions matching any of the given statuses.
+
+    Useful for cleaning up leftover draft/failed versions before a new
+    revision or feedback cycle.  Never deletes the active version.
+    If *keep_version* is given, that version is also excluded from deletion.
+    """
+    backend = await get_backend()
+    placeholders = ", ".join("?" for _ in statuses)
+    params: list = [template_id] + statuses
+
+    extra = ""
+    if keep_version is not None:
+        extra += " AND version <> ?"
+        params.append(keep_version)
+
+    # Safety: don't delete the active version
+    tmpl_rows = await backend.execute(
+        "SELECT active_version FROM catalog_templates WHERE id = ?", (template_id,)
+    )
+    active_ver = tmpl_rows[0]["active_version"] if tmpl_rows and tmpl_rows[0].get("active_version") else None
+    if active_ver is not None:
+        extra += " AND version <> ?"
+        params.append(active_ver)
+
+    count = await backend.execute_write(
+        f"DELETE FROM template_versions WHERE template_id = ? AND status IN ({placeholders}){extra}",
+        tuple(params),
+    )
+    if count:
+        logger.info(f"Deleted {count} template version(s) for {template_id} with status in {statuses}")
+    return count
+
+
+async def set_active_service_version(service_id: str, version: int) -> bool:
+    """Set the active (deployed) version for a service.
+
+    Also promotes the service to 'approved' status and extracts the
+    template's API version from the ARM template for display.
+    """
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Extract template_api_version from the ARM template
+    template_api = None
+    ver_row = await get_service_version(service_id, version)
+    if ver_row:
+        arm_str = ver_row.get("arm_template", "")
+        if arm_str:
+            try:
+                tpl = json.loads(arm_str)
+                resources = tpl.get("resources", [])
+                api_versions = sorted(
+                    {r.get("apiVersion", "") for r in resources
+                     if isinstance(r, dict) and r.get("apiVersion")},
+                    reverse=True,
+                )
+                if api_versions:
+                    template_api = api_versions[0]
+            except Exception:
+                pass
+
+    count = await backend.execute_write(
+        """UPDATE services
+           SET active_version = ?, status = 'approved',
+               approved_date = ?, reviewed_by = 'Deployment Validated',
+               template_api_version = ?
+           WHERE id = ?""",
+        (version, now, template_api, service_id),
+    )
+    logger.info(f"Service {service_id} active_version set to v{version} (template API: {template_api})")
+    invalidate_service_cache()
+    return count > 0
+
+
+async def get_active_service_version(service_id: str) -> dict | None:
+    """Get the currently active version for a service."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT active_version FROM services WHERE id = ?",
+        (service_id,),
+    )
+    if not rows or not rows[0].get("active_version"):
+        return None
+    return await get_service_version(service_id, rows[0]["active_version"])
+
+
+async def is_service_fully_validated(service_id: str) -> tuple[bool, str]:
+    """Check whether a service completed the full onboarding pipeline.
+
+    Returns ``(is_validated, reason)``.
+
+    A service that has not completed the full pipeline may still have an
+    orchestrator-created draft marker. A fully validated service has
+    ``reviewed_by='Deployment Validated'`` (set only by ``set_active_service_version``
+    at pipeline completion).
+    """
+    svc = await get_service(service_id)
+    if not svc:
+        return False, "not_found"
+    if svc.get("status") != "approved":
+        return False, f"status={svc.get('status')}"
+    if svc.get("reviewed_by") in {"orchestrator", "auto_prepped"}:
+        return False, "not_validated"
+    if svc.get("reviewed_by") != "Deployment Validated":
+        return False, f"reviewed_by={svc.get('reviewed_by')}"
+    active = await get_active_service_version(service_id)
+    if not active:
+        return False, "no_active_version"
+    if not active.get("validated_at"):
+        return False, "not_validated"
+    return True, "fully_validated"
+
+
+async def get_version_summary_batch(service_ids: list[str]) -> dict[str, dict]:
+    """Get active + latest version info for multiple services in 1 SQL query.
+
+    Returns a dict keyed by service_id, each containing:
+      active_version, active_semver, latest_version, latest_semver
+    """
+    if not service_ids:
+        return {}
+    backend = await get_backend()
+    placeholders = ", ".join("?" for _ in service_ids)
+
+    # Single query: active version (join on active_version) UNION latest version (max)
+    rows = await backend.execute(
+        f"""SELECT sv.service_id, 'active' AS kind, sv.version, sv.semver
+            FROM services s
+            INNER JOIN service_versions sv
+              ON sv.service_id = s.id AND sv.version = s.active_version
+            WHERE s.id IN ({placeholders})
+            UNION ALL
+            SELECT sv.service_id, 'latest' AS kind, sv.version, sv.semver
+            FROM service_versions sv
+            INNER JOIN (
+                SELECT service_id, MAX(version) AS max_ver
+                FROM service_versions
+                WHERE service_id IN ({placeholders})
+                GROUP BY service_id
+            ) mx ON sv.service_id = mx.service_id AND sv.version = mx.max_ver""",
+        tuple(service_ids) + tuple(service_ids),
+    )
+
+    result: dict[str, dict] = {}
+    for sid in service_ids:
+        result[sid] = {
+            "active_version": None, "active_semver": None,
+            "latest_version": None, "latest_semver": None,
+        }
+
+    for r in rows:
+        sid = r["service_id"]
+        if sid not in result:
+            continue
+        kind = r["kind"]
+        if kind == "active":
+            result[sid]["active_version"] = r["version"]
+            result[sid]["active_semver"] = r["semver"]
+        elif kind == "latest":
+            result[sid]["latest_version"] = r["version"]
+            result[sid]["latest_semver"] = r["semver"]
+
+    return result
+
+
+async def check_versions_exist(pairs: list[tuple[str, int]]) -> dict[tuple[str, int], bool]:
+    """Check which (service_id, version) pairs still exist in service_versions.
+
+    Returns a dict mapping each pair to True/False.  Used to detect
+    phantom pinned versions in composed templates.
+    """
+    if not pairs:
+        return {}
+    backend = await get_backend()
+    # Build a UNION of value-rows so we can do a single LEFT JOIN check
+    # Each pair becomes: SELECT ? AS sid, ? AS ver
+    union_parts = " UNION ALL ".join(["SELECT ? AS sid, ? AS ver"] * len(pairs))
+    flat_params: list = []
+    for sid, ver in pairs:
+        flat_params.extend([sid, ver])
+
+    rows = await backend.execute(
+        f"""SELECT p.sid, p.ver,
+                   CASE WHEN sv.version IS NOT NULL THEN 1 ELSE 0 END AS exists_flag
+            FROM ({union_parts}) p
+            LEFT JOIN service_versions sv
+              ON sv.service_id = p.sid AND sv.version = p.ver""",
+        tuple(flat_params),
+    )
+
+    result: dict[tuple[str, int], bool] = {pair: False for pair in pairs}
+    for r in rows:
+        key = (r["sid"], r["ver"])
+        if key in result:
+            result[key] = bool(r["exists_flag"])
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# PARENT-CHILD CO-VALIDATION
+# ══════════════════════════════════════════════════════════════
+
+async def set_validated_with_parent(
+    service_id: str,
+    version: int,
+    parent_service_id: str,
+    parent_version: int,
+    parent_api_version: str | None,
+) -> None:
+    """Record which parent version a child was co-validated against."""
+    backend = await get_backend()
+    payload = json.dumps({
+        "parent_service_id": parent_service_id,
+        "parent_version": parent_version,
+        "parent_api_version": parent_api_version,
+    })
+    await backend.execute_write(
+        "UPDATE service_versions SET validated_with_parent = ? WHERE service_id = ? AND version = ?",
+        (payload, service_id, version),
+    )
+    logger.info(
+        f"Recorded co-validation: {service_id} v{version} validated with "
+        f"{parent_service_id} v{parent_version} (API {parent_api_version})"
+    )
+
+
+async def check_parent_child_staleness(service_id: str) -> dict | None:
+    """Check if a child service was validated against a now-outdated parent version.
+
+    Returns a staleness dict if stale, or None if fresh/not applicable.
+    """
+    from src.template_engine import get_parent_resource_type
+
+    parent_type = get_parent_resource_type(service_id)
+    if not parent_type:
+        return None
+
+    child_version = await get_active_service_version(service_id)
+    if not child_version:
+        return None
+
+    validated_raw = child_version.get("validated_with_parent")
+    if not validated_raw:
+        return None
+
+    try:
+        validated_with = json.loads(validated_raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if not validated_with.get("parent_service_id"):
+        return None
+
+    parent_svc = await get_service(parent_type)
+    if not parent_svc or not parent_svc.get("active_version"):
+        return None
+
+    parent_active = parent_svc["active_version"]
+    parent_api = parent_svc.get("template_api_version")
+
+    if parent_active == validated_with.get("parent_version"):
+        return None  # Still validated against the current parent version
+
+    return {
+        "stale": True,
+        "child_service_id": service_id,
+        "validated_parent_version": validated_with["parent_version"],
+        "validated_parent_api": validated_with.get("parent_api_version"),
+        "current_parent_version": parent_active,
+        "current_parent_api": parent_api,
+        "parent_api_changed": parent_api != validated_with.get("parent_api_version"),
+        "message": (
+            f"Validated with {parent_type.split('/')[-1]} v{validated_with['parent_version']}, "
+            f"but parent is now at v{parent_active}"
+        ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# GOVERNANCE: SECURITY STANDARDS
+# ══════════════════════════════════════════════════════════════
+
+async def upsert_security_standard(std: dict) -> None:
+    """Insert or replace a security standard."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        "DELETE FROM security_standards WHERE id = ?", (std["id"],))
+    await backend.execute_write(
+        """INSERT INTO security_standards
+           (id, name, description, category, severity,
+            validation_key, validation_value, remediation, enabled,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            std["id"],
+            std["name"],
+            std.get("description", ""),
+            std["category"],
+            std.get("severity", "high"),
+            std["validation_key"],
+            str(std.get("validation_value", "true")),
+            std.get("remediation", ""),
+            int(std.get("enabled", False)),
+            now,
+            now,
+        ),
+    )
+
+
+async def get_security_standards(
+    category: Optional[str] = None,
+    enabled_only: bool = True,
+) -> list[dict]:
+    """Get security standards, optionally filtered."""
+    backend = await get_backend()
+    where_clauses: list[str] = []
+    params: list = []
+    if enabled_only:
+        where_clauses.append("enabled = 1")
+    if category:
+        where_clauses.append("category = ?")
+        params.append(category)
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    return await backend.execute(
+        f"SELECT * FROM security_standards {where_sql} ORDER BY category, id",
+        tuple(params),
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# GOVERNANCE: COMPLIANCE FRAMEWORKS & CONTROLS
+# ══════════════════════════════════════════════════════════════
+
+async def upsert_compliance_framework(fw: dict) -> None:
+    """Insert or replace a compliance framework."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    # Delete child controls first to satisfy FK constraint
+    await backend.execute_write(
+        "DELETE FROM compliance_controls WHERE framework_id = ?", (fw["id"],))
+    await backend.execute_write(
+        "DELETE FROM compliance_frameworks WHERE id = ?", (fw["id"],))
+    await backend.execute_write(
+        """INSERT INTO compliance_frameworks
+           (id, name, description, version, enabled, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            fw["id"],
+            fw["name"],
+            fw.get("description", ""),
+            fw.get("version", "1.0"),
+            int(fw.get("enabled", False)),
+            now,
+        ),
+    )
+
+
+async def upsert_compliance_control(ctrl: dict) -> None:
+    """Insert or replace a compliance control."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        "DELETE FROM compliance_controls WHERE id = ?", (ctrl["id"],))
+    await backend.execute_write(
+        """INSERT INTO compliance_controls
+           (id, framework_id, control_id, name, description,
+            category, security_standard_ids_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            ctrl["id"],
+            ctrl["framework_id"],
+            ctrl["control_id"],
+            ctrl["name"],
+            ctrl.get("description", ""),
+            ctrl.get("category", ""),
+            json.dumps(ctrl.get("security_standard_ids", [])),
+            now,
+        ),
+    )
+
+
+async def get_compliance_frameworks(enabled_only: bool = True) -> list[dict]:
+    """Get compliance frameworks with their control counts."""
+    backend = await get_backend()
+    where = "WHERE enabled = 1" if enabled_only else ""
+    frameworks = await backend.execute(
+        f"SELECT * FROM compliance_frameworks {where} ORDER BY name", ())
+    for fw in frameworks:
+        controls = await backend.execute(
+            "SELECT * FROM compliance_controls WHERE framework_id = ? ORDER BY control_id",
+            (fw["id"],),
+        )
+        for c in controls:
+            c["security_standard_ids"] = json.loads(
+                c.pop("security_standard_ids_json", "[]"))
+        fw["controls"] = controls
+    return frameworks
+
+
+# ══════════════════════════════════════════════════════════════
+# GOVERNANCE: ORGANIZATION-WIDE POLICIES
+# ══════════════════════════════════════════════════════════════
+
+async def upsert_governance_policy(pol: dict) -> None:
+    """Insert or replace a governance policy."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        "DELETE FROM governance_policies WHERE id = ?", (pol["id"],))
+    await backend.execute_write(
+        """INSERT INTO governance_policies
+           (id, name, description, category, rule_key,
+            rule_value_json, severity, enforcement, enabled,
+            risk_id, policy_statement, purpose, scope,
+            remediation, enforcement_tool,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            pol["id"],
+            pol["name"],
+            pol.get("description", ""),
+            pol["category"],
+            pol["rule_key"],
+            json.dumps(pol["rule_value"]),
+            pol.get("severity", "high"),
+            pol.get("enforcement", "block"),
+            int(pol.get("enabled", False)),
+            pol.get("risk_id", ""),
+            pol.get("policy_statement", ""),
+            pol.get("purpose", ""),
+            pol.get("scope", "All cloud resources"),
+            pol.get("remediation", ""),
+            pol.get("enforcement_tool", ""),
+            now,
+            now,
+        ),
+    )
+
+
+async def get_governance_policies(
+    category: Optional[str] = None,
+    enabled_only: bool = True,
+) -> list[dict]:
+    """Get governance policies, optionally filtered."""
+    backend = await get_backend()
+    where_clauses: list[str] = ["category != 'migration'"]
+    params: list = []
+    if enabled_only:
+        where_clauses.append("enabled = 1")
+    if category:
+        where_clauses.append("category = ?")
+        params.append(category)
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    rows = await backend.execute(
+        f"SELECT * FROM governance_policies {where_sql} ORDER BY category, id",
+        tuple(params),
+    )
+    for r in rows:
+        r["rule_value"] = json.loads(r.pop("rule_value_json", "null"))
+    return rows
+
+
+async def get_governance_policies_as_dict() -> dict:
+    """Get active governance policies as a flat dict keyed by rule_key.
+
+    Returns something like:
+    {
+        "require_tags": ["environment", "owner", "costCenter", "project"],
+        "allowed_regions": ["eastus2", "westus2", "westeurope"],
+        "require_https": True,
+        ...
+    }
+    """
+    policies = await get_governance_policies(enabled_only=True)
+    result = {}
+    for p in policies:
+        result[p["rule_key"]] = p["rule_value"]
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# GOVERNANCE: COMPLIANCE ASSESSMENTS
+# ══════════════════════════════════════════════════════════════
+
+async def save_compliance_assessment(assessment: dict) -> str:
+    """Save a compliance assessment result."""
+    backend = await get_backend()
+    assessment_id = assessment.get(
+        "id", f"CA-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """INSERT INTO compliance_assessments
+           (id, approval_request_id, assessed_at, assessed_by,
+            overall_result, standards_checked_json, findings_json, score)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            assessment_id,
+            assessment.get("approval_request_id"),
+            now,
+            assessment.get("assessed_by", "InfraForge"),
+            assessment.get("overall_result", "pending"),
+            json.dumps(assessment.get("standards_checked", [])),
+            json.dumps(assessment.get("findings", [])),
+            assessment.get("score", 0.0),
+        ),
+    )
+    # Link back to approval request if provided
+    if assessment.get("approval_request_id"):
+        await backend.execute_write(
+            """UPDATE approval_requests
+               SET compliance_assessment_id = ?, security_score = ?,
+                   compliance_results_json = ?
+               WHERE id = ?""",
+            (
+                assessment_id,
+                assessment.get("score", 0.0),
+                json.dumps(assessment.get("findings", [])),
+                assessment["approval_request_id"],
+            ),
+        )
+    return assessment_id
+
+
+async def get_compliance_assessment(assessment_id: str) -> Optional[dict]:
+    """Get a compliance assessment by ID."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM compliance_assessments WHERE id = ?",
+        (assessment_id,),
+    )
+    if not rows:
+        return None
+    result = rows[0]
+    result["standards_checked"] = json.loads(
+        result.pop("standards_checked_json", "[]"))
+    result["findings"] = json.loads(result.pop("findings_json", "[]"))
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# SEED: POPULATE GOVERNANCE DATA ON FIRST RUN
+# ══════════════════════════════════════════════════════════════
+
+async def seed_governance_data() -> dict:
+    """Run migrations and seed orchestration processes on startup.
+
+    Services, security standards, compliance frameworks, and governance
+    policies are NOT pre-seeded.  All services come from Azure sync
+    (on-demand via the Sync button).
+
+    Returns a summary of what was seeded.
+    """
+    backend = await get_backend()
+    summary = {}
+
+    # Always run CAF migration on existing governance policies
+    await _apply_governance_caf_fields(backend)
+    # Fix naming convention to include {region}
+    await _fix_naming_convention_region(backend)
+    # Disable seed policies so fresh installs don't block deployments
+    await _disable_seed_policies_by_default(backend)
+
+    # ── Seed templates (no-op — templates require approved services) ──
+    tmpl_rows = await backend.execute("SELECT COUNT(*) as cnt FROM catalog_templates", ())
+    templates_exist = tmpl_rows and tmpl_rows[0]["cnt"] > 0
+    if not templates_exist:
+        await _seed_templates(summary)
+
+    # ── Seed orchestration processes ──
+    proc_count = await seed_orchestration_processes()
+    summary["orchestration_processes"] = proc_count
+
+    # ── Seed agent definitions ──
+    agent_count = await seed_agent_definitions()
+    summary["agent_definitions"] = agent_count
+
+    logger.info(f"Startup seed complete: {summary}")
+    return summary
+
+
+# CAF field defaults for existing governance policies.
+_GOV_CAF_DEFAULTS: dict[str, dict] = {
+    "GOV-001": {
+        "risk_id": "R07",
+        "policy_statement": "Tags must be enforced on all cloud resources using Azure Policy.",
+        "purpose": "Facilitate resource tracking, cost attribution, and ownership accountability across all teams",
+        "scope": "All cloud resources",
+        "remediation": "Correct tagging within 30 days. Non-compliant resources flagged in compliance dashboard.",
+        "enforcement_tool": "Azure Policy",
+    },
+    "GOV-002": {
+        "risk_id": "R01",
+        "policy_statement": "Resources must only be deployed to approved Azure regions (eastus2, westus2, westeurope).",
+        "purpose": "Ensure regulatory compliance with data residency requirements and reduce latency",
+        "scope": "All cloud resources, all environments",
+        "remediation": "Immediate blocking at deployment time. Non-compliant resources must be redeployed to an approved region.",
+        "enforcement_tool": "Azure Policy",
+    },
+    "GOV-003": {
+        "risk_id": "R02",
+        "policy_statement": "All web-facing resources must enforce HTTPS. HTTP must not be allowed.",
+        "purpose": "Mitigate data breaches and man-in-the-middle attacks on data in transit",
+        "scope": "Workload teams, all web-facing resources",
+        "remediation": "Immediate corrective action. Enable HTTPS-only and disable HTTP listeners.",
+        "enforcement_tool": "Azure Policy",
+    },
+    "GOV-004": {
+        "risk_id": "R02",
+        "policy_statement": "Resources should use managed identities instead of stored credentials, keys, or passwords.",
+        "purpose": "Eliminate credential exposure risk by using Azure-managed identity lifecycle",
+        "scope": "Workload teams, platform team",
+        "remediation": "Architecture review within 30 days. Transition to SystemAssigned or UserAssigned managed identity.",
+        "enforcement_tool": "Azure Policy",
+    },
+    "GOV-005": {
+        "risk_id": "R02",
+        "policy_statement": "Production resources must use private endpoints. Public network access must not be enabled in production.",
+        "purpose": "Ensure production data flows over private Azure backbone, not public internet",
+        "scope": "Production workloads, platform team",
+        "remediation": "Immediate blocking at deployment. Create private endpoint in the appropriate VNet/subnet.",
+        "enforcement_tool": "Azure Policy",
+    },
+    "GOV-006": {
+        "risk_id": "R02",
+        "policy_statement": "Public IP addresses must not be provisioned unless an explicit exception is approved.",
+        "purpose": "Reduce attack surface by preventing uncontrolled internet-facing endpoints",
+        "scope": "All cloud resources, all environments",
+        "remediation": "Immediate blocking. Submit exception request with business justification for public endpoints.",
+        "enforcement_tool": "Azure Policy",
+    },
+    "GOV-007": {
+        "risk_id": "R07",
+        "policy_statement": "All resources should follow the naming convention: {resourceType}-{project}-{environment}-{region}-{instance}. The {region} segment must use the standard abbreviation and must match the actual deployment region.",
+        "purpose": "Standardize resource provisioning and improve operational clarity across teams",
+        "scope": "Workload teams, platform team",
+        "remediation": "Rename resources within 60 days. New resources blocked if naming pattern is not followed.",
+        "enforcement_tool": "Azure Policy",
+    },
+    "GOV-008": {
+        "risk_id": "R04",
+        "policy_statement": "Workload teams must set budget alerts at the resource group level. Requests exceeding $5,000/month must receive manager approval.",
+        "purpose": "Prevent overspending and ensure cost accountability through budget gate controls",
+        "scope": "Workload teams, platform team",
+        "remediation": "Immediate review. Submit cost exception request or reduce resource SKU/count.",
+        "enforcement_tool": "Microsoft Cost Management",
+    },
+}
+
+
+async def _apply_governance_caf_fields(backend) -> None:
+    """Populate Cloud Adoption Framework fields on existing governance policies.
+
+    Adds risk_id, policy_statement, purpose, scope, remediation, and
+    enforcement_tool values to governance policies that were created
+    before the CAF alignment migration.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    updated = 0
+
+    for pol_id, caf in _GOV_CAF_DEFAULTS.items():
+        rows = await backend.execute(
+            "SELECT risk_id, policy_statement, purpose FROM governance_policies WHERE id = ?",
+            (pol_id,),
+        )
+        if not rows:
+            continue
+
+        current = rows[0]
+        # Skip if already populated
+        if (current.get("risk_id") or "") and (current.get("policy_statement") or "") and (current.get("purpose") or ""):
+            continue
+
+        await backend.execute_write(
+            """UPDATE governance_policies
+               SET risk_id = ?, policy_statement = ?, purpose = ?,
+                   scope = ?, remediation = ?, enforcement_tool = ?,
+                   updated_at = ?
+               WHERE id = ?""",
+            (
+                caf["risk_id"], caf["policy_statement"], caf["purpose"],
+                caf["scope"], caf["remediation"], caf["enforcement_tool"],
+                now, pol_id,
+            ),
+        )
+        updated += 1
+
+    if updated:
+        logger.info(f"Populated CAF fields on {updated} governance policy/policies")
+
+
+async def _disable_seed_policies_by_default(backend) -> None:
+    """One-time migration: disable all seed governance policies and security standards.
+
+    Out of the box, a fresh install should have no active policies blocking
+    deployments. Admins explicitly enable the policies they want.
+
+    Uses a migration marker (GOV-MIGRATION-001) in governance_policies to
+    ensure this only runs once.
+    """
+    # Check if migration already applied
+    marker = await backend.execute(
+        "SELECT id FROM governance_policies WHERE id = 'GOV-MIGRATION-001'",
+        (),
+    )
+    if marker:
+        return  # already applied
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Disable all governance policies
+    await backend.execute_write(
+        "UPDATE governance_policies SET enabled = 0, updated_at = ? WHERE enabled = 1",
+        (now,),
+    )
+
+    # Disable all security standards
+    await backend.execute_write(
+        "UPDATE security_standards SET enabled = 0, updated_at = ? WHERE enabled = 1",
+        (now,),
+    )
+
+    # Record that this migration has been applied
+    await backend.execute_write(
+        """INSERT INTO governance_policies
+           (id, name, description, category, rule_key,
+            rule_value_json, severity, enforcement, enabled,
+            risk_id, policy_statement, purpose, scope,
+            remediation, enforcement_tool,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "GOV-MIGRATION-001",
+            "Migration: disable seed policies",
+            "Marker row — indicates the disable-seed-policies migration has run.",
+            "migration", "migration_disable_seed_policies",
+            '"applied"', "low", "warn", 0,
+            "", "", "", "", "", "",
+            now, now,
+        ),
+    )
+    logger.info("Migration: disabled all seed governance policies and security standards")
+
+
+async def _fix_naming_convention_region(backend) -> None:
+    """Ensure GOV-007 naming convention includes {region} segment.
+
+    Earlier versions used {resourceType}-{project}-{environment}-{instance}
+    which omitted the region — causing resource names to not reflect their
+    actual deployment region.
+    """
+    rows = await backend.execute(
+        "SELECT rule_value_json FROM governance_policies WHERE id = 'GOV-007'",
+        (),
+    )
+    if not rows:
+        return
+    current_pattern = rows[0].get("rule_value_json", "")
+    if "{region}" in current_pattern:
+        return  # already fixed
+
+    new_pattern = "{resourceType}-{project}-{environment}-{region}-{instance}"
+    new_statement = (
+        "All resources should follow the naming convention: "
+        f"{new_pattern}. The {{region}} segment must use the standard "
+        "abbreviation (e.g. eus2 for East US 2) and must match the "
+        "actual deployment region."
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """UPDATE governance_policies
+           SET rule_value_json = ?, policy_statement = ?, updated_at = ?
+           WHERE id = 'GOV-007'""",
+        (json.dumps(new_pattern), new_statement, now),
+    )
+    logger.info("Fixed GOV-007 naming convention to include {region} segment")
+
+
+async def _seed_governance_and_services(backend, summary: dict, now: str) -> None:
+    """Seed security standards, compliance frameworks, governance policies, and services."""
+    # ══════════════════════════════════════════════════════════
+    # 1. SECURITY STANDARDS
+    # ══════════════════════════════════════════════════════════
+    security_standards = [
+        {
+            "id": "SEC-001", "name": "HTTPS Required",
+            "description": "All web-facing resources must enforce HTTPS-only access. HTTP must be disabled.",
+            "category": "encryption", "severity": "critical",
+            "validation_key": "require_https", "validation_value": "true",
+            "remediation": "Set httpsOnly=true in resource configuration. Disable HTTP listeners.",
+        },
+        {
+            "id": "SEC-002", "name": "TLS 1.2 Minimum",
+            "description": "All resources must use TLS 1.2 or higher. Older TLS/SSL versions are prohibited.",
+            "category": "encryption", "severity": "critical",
+            "validation_key": "min_tls_version", "validation_value": "1.2",
+            "remediation": "Set minTlsVersion to '1.2' in resource properties.",
+        },
+        {
+            "id": "SEC-003", "name": "Managed Identity Required",
+            "description": "Resources must use managed identities for authentication instead of stored credentials, keys, or passwords.",
+            "category": "identity", "severity": "high",
+            "validation_key": "require_managed_identity", "validation_value": "true",
+            "remediation": "Enable system-assigned or user-assigned managed identity. Remove stored credentials.",
+        },
+        {
+            "id": "SEC-004", "name": "No Public Access",
+            "description": "Resources must not expose public endpoints unless explicitly approved. Use private endpoints or VNet integration.",
+            "category": "network", "severity": "high",
+            "validation_key": "deny_public_access", "validation_value": "true",
+            "remediation": "Disable public network access. Configure private endpoints.",
+        },
+        {
+            "id": "SEC-005", "name": "Encryption at Rest",
+            "description": "All data stores must use encryption at rest with platform-managed or customer-managed keys.",
+            "category": "encryption", "severity": "critical",
+            "validation_key": "require_encryption_at_rest", "validation_value": "true",
+            "remediation": "Enable Transparent Data Encryption (TDE) or Storage Service Encryption (SSE).",
+        },
+        {
+            "id": "SEC-006", "name": "Diagnostic Logging",
+            "description": "All resources must have diagnostic logging enabled and connected to Log Analytics.",
+            "category": "monitoring", "severity": "high",
+            "validation_key": "require_diagnostic_logging", "validation_value": "true",
+            "remediation": "Enable diagnostic settings and connect to a Log Analytics workspace.",
+        },
+        {
+            "id": "SEC-007", "name": "Soft Delete / Purge Protection",
+            "description": "Key Vaults and storage accounts must have soft delete and purge protection enabled.",
+            "category": "data_protection", "severity": "high",
+            "validation_key": "require_soft_delete", "validation_value": "true",
+            "remediation": "Enable soft delete and purge protection on Key Vault / Storage Account.",
+        },
+        {
+            "id": "SEC-008", "name": "RBAC Authorization",
+            "description": "Key Vaults must use RBAC authorization model instead of access policies.",
+            "category": "identity", "severity": "high",
+            "validation_key": "require_rbac_auth", "validation_value": "true",
+            "remediation": "Set Key Vault access model to 'Azure role-based access control'.",
+        },
+        {
+            "id": "SEC-009", "name": "Network Security Groups Required",
+            "description": "All VNet subnets must have a Network Security Group (NSG) attached.",
+            "category": "network", "severity": "high",
+            "validation_key": "require_nsg_on_subnets", "validation_value": "true",
+            "remediation": "Create and attach an NSG to every subnet in the VNet.",
+        },
+        {
+            "id": "SEC-010", "name": "Remote Debugging Disabled",
+            "description": "Remote debugging must be disabled on all production App Service resources.",
+            "category": "compute", "severity": "medium",
+            "validation_key": "deny_remote_debugging", "validation_value": "true",
+            "remediation": "Disable remote debugging in App Service configuration.",
+        },
+        {
+            "id": "SEC-011", "name": "Azure AD Authentication",
+            "description": "Databases and services supporting Azure AD auth must use it instead of local SQL auth.",
+            "category": "identity", "severity": "high",
+            "validation_key": "require_aad_auth", "validation_value": "true",
+            "remediation": "Enable Azure AD authentication. Disable or restrict local SQL authentication.",
+        },
+        {
+            "id": "SEC-012", "name": "Azure Defender / Microsoft Defender",
+            "description": "Microsoft Defender must be enabled for applicable resource types (SQL, Storage, VMs, Containers).",
+            "category": "monitoring", "severity": "high",
+            "validation_key": "require_defender", "validation_value": "true",
+            "remediation": "Enable Microsoft Defender for the resource type in Defender for Cloud.",
+        },
+        {
+            "id": "SEC-013", "name": "Blob Public Access Disabled",
+            "description": "Storage accounts must have blob public access disabled at the account level.",
+            "category": "data_protection", "severity": "critical",
+            "validation_key": "deny_blob_public_access", "validation_value": "true",
+            "remediation": "Set 'Allow Blob public access' to Disabled on the storage account.",
+        },
+        {
+            "id": "SEC-014", "name": "Automated OS Patching",
+            "description": "Virtual machines must have automated OS patching enabled.",
+            "category": "compute", "severity": "medium",
+            "validation_key": "require_auto_patching", "validation_value": "true",
+            "remediation": "Enable Azure Update Manager automatic patching.",
+        },
+        {
+            "id": "SEC-015", "name": "Private Endpoint Required (Production)",
+            "description": "Production-tier resources must use private endpoints instead of public access.",
+            "category": "network", "severity": "high",
+            "validation_key": "require_private_endpoints", "validation_value": "true",
+            "remediation": "Create a private endpoint for the resource in the appropriate VNet/subnet.",
+        },
+    ]
+
+    for std in security_standards:
+        await upsert_security_standard(std)
+    summary["security_standards"] = len(security_standards)
+
+    # ══════════════════════════════════════════════════════════
+    # 2. COMPLIANCE FRAMEWORKS & CONTROLS
+    # ══════════════════════════════════════════════════════════
+    frameworks = [
+        {
+            "id": "CIS-AZURE-2.0",
+            "name": "CIS Microsoft Azure Foundations Benchmark",
+            "description": "Center for Internet Security benchmark for Azure — industry-standard security baseline.",
+            "version": "2.0",
+            "controls": [
+                {"control_id": "2.1.1", "name": "Ensure TLS 1.2+ for Storage",
+                 "category": "storage", "standard_ids": ["SEC-002"]},
+                {"control_id": "2.1.2", "name": "Ensure HTTPS Transfer Required",
+                 "category": "storage", "standard_ids": ["SEC-001"]},
+                {"control_id": "3.1", "name": "Ensure Diagnostic Logging Enabled",
+                 "category": "logging", "standard_ids": ["SEC-006"]},
+                {"control_id": "4.1.1", "name": "Ensure Azure SQL AD Auth Enabled",
+                 "category": "database", "standard_ids": ["SEC-011"]},
+                {"control_id": "4.1.3", "name": "Ensure SQL TDE Enabled",
+                 "category": "database", "standard_ids": ["SEC-005"]},
+                {"control_id": "4.2.1", "name": "Ensure Defender for SQL Enabled",
+                 "category": "database", "standard_ids": ["SEC-012"]},
+                {"control_id": "5.1.1", "name": "Ensure NSG on All Subnets",
+                 "category": "networking", "standard_ids": ["SEC-009"]},
+                {"control_id": "7.1", "name": "Ensure VM Managed Disks Encrypted",
+                 "category": "compute", "standard_ids": ["SEC-005"]},
+                {"control_id": "8.1", "name": "Ensure Key Vault Soft Delete Enabled",
+                 "category": "security", "standard_ids": ["SEC-007"]},
+                {"control_id": "8.5", "name": "Ensure Key Vault RBAC Mode",
+                 "category": "security", "standard_ids": ["SEC-008"]},
+            ],
+        },
+        {
+            "id": "SOC2-TYPE2",
+            "name": "SOC 2 Type II",
+            "description": "Service Organization Control 2 — Trust Services Criteria for security, availability, and confidentiality.",
+            "version": "2024",
+            "controls": [
+                {"control_id": "CC6.1", "name": "Logical and Physical Access Controls",
+                 "category": "access_control", "standard_ids": ["SEC-003", "SEC-008", "SEC-011"]},
+                {"control_id": "CC6.3", "name": "Role-Based Access",
+                 "category": "access_control", "standard_ids": ["SEC-008"]},
+                {"control_id": "CC6.6", "name": "Secure Transmission",
+                 "category": "encryption", "standard_ids": ["SEC-001", "SEC-002"]},
+                {"control_id": "CC6.7", "name": "Data-at-Rest Encryption",
+                 "category": "encryption", "standard_ids": ["SEC-005", "SEC-013"]},
+                {"control_id": "CC7.1", "name": "Monitoring and Detection",
+                 "category": "monitoring", "standard_ids": ["SEC-006", "SEC-012"]},
+                {"control_id": "CC7.2", "name": "Incident Response",
+                 "category": "monitoring", "standard_ids": ["SEC-006"]},
+                {"control_id": "CC8.1", "name": "Change Management",
+                 "category": "operations", "standard_ids": ["SEC-014"]},
+            ],
+        },
+        {
+            "id": "HIPAA",
+            "name": "HIPAA Security Rule",
+            "description": "Health Insurance Portability and Accountability Act — security standards for protecting ePHI.",
+            "version": "2024",
+            "controls": [
+                {"control_id": "164.312(a)(1)", "name": "Access Control",
+                 "category": "access_control", "standard_ids": ["SEC-003", "SEC-008", "SEC-011"]},
+                {"control_id": "164.312(a)(2)(iv)", "name": "Encryption and Decryption",
+                 "category": "encryption", "standard_ids": ["SEC-005"]},
+                {"control_id": "164.312(b)", "name": "Audit Controls",
+                 "category": "monitoring", "standard_ids": ["SEC-006"]},
+                {"control_id": "164.312(c)(1)", "name": "Integrity",
+                 "category": "data_protection", "standard_ids": ["SEC-007", "SEC-013"]},
+                {"control_id": "164.312(e)(1)", "name": "Transmission Security",
+                 "category": "encryption", "standard_ids": ["SEC-001", "SEC-002"]},
+            ],
+        },
+    ]
+
+    for fw in frameworks:
+        await upsert_compliance_framework({
+            "id": fw["id"],
+            "name": fw["name"],
+            "description": fw["description"],
+            "version": fw["version"],
+        })
+        for ctrl in fw["controls"]:
+            await upsert_compliance_control({
+                "id": f"{fw['id']}-{ctrl['control_id']}",
+                "framework_id": fw["id"],
+                "control_id": ctrl["control_id"],
+                "name": ctrl["name"],
+                "category": ctrl.get("category", ""),
+                "security_standard_ids": ctrl.get("standard_ids", []),
+            })
+    summary["compliance_frameworks"] = len(frameworks)
+    summary["compliance_controls"] = sum(len(fw["controls"]) for fw in frameworks)
+
+    # ══════════════════════════════════════════════════════════
+    # 3. GOVERNANCE POLICIES (org-wide rules — CAF-aligned)
+    #    Per Microsoft Cloud Adoption Framework, each policy has:
+    #    policy_statement, risk_id, purpose, scope, remediation, enforcement_tool
+    # ══════════════════════════════════════════════════════════
+    governance_policies_data = [
+        {
+            "id": "GOV-001", "name": "Required Resource Tags",
+            "description": "All Azure resources must include these tags for cost attribution, ownership tracking, and operational management.",
+            "category": "tagging", "rule_key": "require_tags",
+            "rule_value": ["environment", "owner", "costCenter", "project"],
+            "severity": "high", "enforcement": "block",
+            "risk_id": "R07",
+            "policy_statement": "Tags must be enforced on all cloud resources using Azure Policy.",
+            "purpose": "Facilitate resource tracking, cost attribution, and ownership accountability across all teams",
+            "scope": "All cloud resources",
+            "remediation": "Correct tagging within 30 days. Non-compliant resources flagged in compliance dashboard.",
+            "enforcement_tool": "Azure Policy",
+        },
+        {
+            "id": "GOV-002", "name": "Allowed Deployment Regions",
+            "description": "Resources may only be deployed to approved Azure regions. Other regions are blocked.",
+            "category": "geography", "rule_key": "allowed_regions",
+            "rule_value": ["eastus2", "westus2", "westeurope"],
+            "severity": "critical", "enforcement": "block",
+            "risk_id": "R01",
+            "policy_statement": "Resources must only be deployed to approved Azure regions (eastus2, westus2, westeurope).",
+            "purpose": "Ensure regulatory compliance with data residency requirements and reduce latency",
+            "scope": "All cloud resources, all environments",
+            "remediation": "Immediate blocking at deployment time. Non-compliant resources must be redeployed to an approved region.",
+            "enforcement_tool": "Azure Policy",
+        },
+        {
+            "id": "GOV-003", "name": "HTTPS Enforcement",
+            "description": "All web-facing resources must enforce HTTPS. HTTP-only endpoints are blocked.",
+            "category": "security", "rule_key": "require_https",
+            "rule_value": True,
+            "severity": "critical", "enforcement": "block",
+            "risk_id": "R02",
+            "policy_statement": "All web-facing resources must enforce HTTPS. HTTP must not be allowed.",
+            "purpose": "Mitigate data breaches and man-in-the-middle attacks on data in transit",
+            "scope": "Workload teams, all web-facing resources",
+            "remediation": "Immediate corrective action. Enable HTTPS-only and disable HTTP listeners.",
+            "enforcement_tool": "Azure Policy",
+        },
+        {
+            "id": "GOV-004", "name": "Managed Identity Enforcement",
+            "description": "Resources must use managed identities for authentication instead of stored credentials.",
+            "category": "security", "rule_key": "require_managed_identity",
+            "rule_value": True,
+            "severity": "high", "enforcement": "warn",
+            "risk_id": "R02",
+            "policy_statement": "Resources should use managed identities instead of stored credentials, keys, or passwords.",
+            "purpose": "Eliminate credential exposure risk by using Azure-managed identity lifecycle",
+            "scope": "Workload teams, platform team",
+            "remediation": "Architecture review within 30 days. Transition to SystemAssigned or UserAssigned managed identity.",
+            "enforcement_tool": "Azure Policy",
+        },
+        {
+            "id": "GOV-005", "name": "Private Endpoints (Production)",
+            "description": "Production resources must use private endpoints. Public endpoints are blocked in production.",
+            "category": "network", "rule_key": "require_private_endpoints",
+            "rule_value": True,
+            "severity": "high", "enforcement": "block",
+            "risk_id": "R02",
+            "policy_statement": "Production resources must use private endpoints. Public network access must not be enabled in production.",
+            "purpose": "Ensure production data flows over private Azure backbone, not public internet",
+            "scope": "Production workloads, platform team",
+            "remediation": "Immediate blocking at deployment. Create private endpoint in the appropriate VNet/subnet.",
+            "enforcement_tool": "Azure Policy",
+        },
+        {
+            "id": "GOV-006", "name": "Public IP Restriction",
+            "description": "No public IP addresses unless explicitly approved via exception request.",
+            "category": "network", "rule_key": "max_public_ips",
+            "rule_value": 0,
+            "severity": "high", "enforcement": "block",
+            "risk_id": "R02",
+            "policy_statement": "Public IP addresses must not be provisioned unless an explicit exception is approved.",
+            "purpose": "Reduce attack surface by preventing uncontrolled internet-facing endpoints",
+            "scope": "All cloud resources, all environments",
+            "remediation": "Immediate blocking. Submit exception request with business justification for public endpoints.",
+            "enforcement_tool": "Azure Policy",
+        },
+        {
+            "id": "GOV-007", "name": "Naming Convention",
+            "description": "All resources must follow the organizational naming convention.",
+            "category": "operations", "rule_key": "naming_convention",
+            "rule_value": "{resourceType}-{project}-{environment}-{region}-{instance}",
+            "severity": "medium", "enforcement": "warn",
+            "risk_id": "R07",
+            "policy_statement": "All resources should follow the naming convention: {resourceType}-{project}-{environment}-{region}-{instance}. The {region} segment must use the standard abbreviation (e.g. eus2 for East US 2) and must match the actual deployment region.",
+            "purpose": "Standardize resource provisioning and improve operational clarity across teams",
+            "scope": "Workload teams, platform team",
+            "remediation": "Rename resources within 60 days. New resources blocked if naming pattern is not followed.",
+            "enforcement_tool": "Azure Policy",
+        },
+        {
+            "id": "GOV-008", "name": "Budget Alert Threshold",
+            "description": "Infrastructure requests exceeding the monthly cost threshold require manager approval.",
+            "category": "cost", "rule_key": "cost_approval_threshold",
+            "rule_value": 5000,
+            "severity": "medium", "enforcement": "warn",
+            "risk_id": "R04",
+            "policy_statement": "Workload teams must set budget alerts at the resource group level. Requests exceeding $5,000/month must receive manager approval.",
+            "purpose": "Prevent overspending and ensure cost accountability through budget gate controls",
+            "scope": "Workload teams, platform team",
+            "remediation": "Immediate review. Submit cost exception request or reduce resource SKU/count.",
+            "enforcement_tool": "Microsoft Cost Management",
+        },
+    ]
+
+    for pol in governance_policies_data:
+        await upsert_governance_policy(pol)
+    summary["governance_policies"] = len(governance_policies_data)
+
+    # ══════════════════════════════════════════════════════════
+    # 4. SERVICES CATALOG — all start as not_approved
+    #    Approval requires the 3-gate process (policy + template + pipeline)
+    # ══════════════════════════════════════════════════════════
+    services_data = [
+        # ── Compute ──
+        {"id": "Microsoft.Web/serverfarms", "name": "App Service Plan", "category": "compute",
+         "status": "not_approved", "risk_tier": "low"},
+        {"id": "Microsoft.Web/sites", "name": "App Service", "category": "compute",
+         "status": "not_approved", "risk_tier": "low"},
+        {"id": "Microsoft.ContainerInstance/containerGroups",
+         "name": "Azure Container Instances", "category": "compute",
+         "status": "not_approved", "risk_tier": "medium"},
+        {"id": "Microsoft.App/containerApps", "name": "Azure Container Apps",
+         "category": "compute", "status": "not_approved", "risk_tier": "medium"},
+        {"id": "Microsoft.ContainerService/managedClusters",
+         "name": "Azure Kubernetes Service (AKS)", "category": "compute",
+         "status": "not_approved", "risk_tier": "high"},
+        {"id": "Microsoft.Compute/virtualMachines", "name": "Virtual Machines",
+         "category": "compute", "status": "not_approved", "risk_tier": "high"},
+
+        # ── Databases ──
+        {"id": "Microsoft.Sql/servers", "name": "Azure SQL Server",
+         "category": "database", "status": "not_approved", "risk_tier": "medium"},
+        {"id": "Microsoft.Sql/servers/databases", "name": "Azure SQL Database",
+         "category": "database", "status": "not_approved", "risk_tier": "medium"},
+        {"id": "Microsoft.DBforPostgreSQL/flexibleServers",
+         "name": "Azure Database for PostgreSQL (Flexible Server)",
+         "category": "database", "status": "not_approved", "risk_tier": "medium"},
+        {"id": "Microsoft.DocumentDB/databaseAccounts",
+         "name": "Azure Cosmos DB", "category": "database",
+         "status": "not_approved", "risk_tier": "high"},
+        {"id": "Microsoft.Cache/Redis", "name": "Azure Cache for Redis",
+         "category": "database", "status": "not_approved", "risk_tier": "low"},
+
+        # ── Security & Identity ──
+        {"id": "Microsoft.KeyVault/vaults", "name": "Azure Key Vault",
+         "category": "security", "status": "not_approved", "risk_tier": "critical"},
+        {"id": "Microsoft.ManagedIdentity/userAssignedIdentities",
+         "name": "User-Assigned Managed Identity", "category": "security",
+         "status": "not_approved", "risk_tier": "low"},
+
+        # ── Storage ──
+        {"id": "Microsoft.Storage/storageAccounts",
+         "name": "Azure Storage Account", "category": "storage",
+         "status": "not_approved", "risk_tier": "medium"},
+
+        # ── Monitoring ──
+        {"id": "Microsoft.OperationalInsights/workspaces",
+         "name": "Log Analytics Workspace", "category": "monitoring",
+         "status": "not_approved", "risk_tier": "low"},
+        {"id": "Microsoft.Insights/components",
+         "name": "Application Insights", "category": "monitoring",
+         "status": "not_approved", "risk_tier": "low"},
+
+        # ── Networking ──
+        {"id": "Microsoft.Network/virtualNetworks",
+         "name": "Virtual Network", "category": "networking",
+         "status": "not_approved", "risk_tier": "medium"},
+        {"id": "Microsoft.Network/applicationGateways",
+         "name": "Application Gateway", "category": "networking",
+         "status": "not_approved", "risk_tier": "high"},
+
+        # ── AI ──
+        {"id": "Microsoft.MachineLearningServices/workspaces",
+         "name": "Azure Machine Learning", "category": "ai",
+         "status": "not_approved", "risk_tier": "high"},
+        {"id": "Microsoft.CognitiveServices/accounts",
+         "name": "Azure AI Services (Cognitive Services)", "category": "ai",
+         "status": "not_approved", "risk_tier": "high"},
+
+    ]
+
+    for svc in services_data:
+        await upsert_service(svc)
+    summary["services"] = len(services_data)
+
+
+async def _seed_templates(summary: dict) -> None:
+    """Skip template seeding — templates require approved services first.
+
+    The 3-gate workflow means services must be individually approved
+    (policy + template + pipeline) before catalog templates can be built
+    from them. Templates will be created by IT Staff after services are approved.
+    """
+    summary["templates"] = 0
+    logger.info("Template seeding skipped — no approved services yet")
+
+
+# ══════════════════════════════════════════════════════════════
+# PIPELINE RUN TRACKING
+# ══════════════════════════════════════════════════════════════
+
+async def create_pipeline_run(
+    run_id: str,
+    service_id: str,
+    pipeline_type: str,
+    *,
+    version_num: int | None = None,
+    semver: str | None = None,
+    created_by: str | None = None,
+) -> dict:
+    """Insert a new pipeline run record with status='running'."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """INSERT INTO pipeline_runs
+           (run_id, service_id, pipeline_type, status, version_num, semver,
+            started_at, created_by)
+           VALUES (?, ?, ?, 'running', ?, ?, ?, ?)""",
+        (run_id, service_id, pipeline_type, version_num, semver or "", now, created_by or ""),
+    )
+    return {"run_id": run_id, "service_id": service_id, "pipeline_type": pipeline_type,
+            "status": "running", "started_at": now}
+
+
+async def complete_pipeline_run(
+    run_id: str,
+    status: str = "completed",
+    *,
+    version_num: int | None = None,
+    semver: str | None = None,
+    summary: dict | None = None,
+    error_detail: str | None = None,
+    heal_count: int = 0,
+    events_json: str | None = None,
+    last_event_at: str | None = None,
+) -> None:
+    """Mark a pipeline run as completed/failed/interrupted."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Calculate duration
+    rows = await backend.execute(
+        "SELECT started_at FROM pipeline_runs WHERE run_id = ?", (run_id,)
+    )
+    duration = None
+    if rows and rows[0].get("started_at"):
+        try:
+            started = datetime.fromisoformat(rows[0]["started_at"])
+            completed = datetime.fromisoformat(now)
+            duration = (completed - started).total_seconds()
+        except (ValueError, TypeError):
+            pass
+
+    summary_json = json.dumps(summary or {}, default=str)
+
+    updates = [
+        "status = ?", "completed_at = ?", "duration_secs = ?",
+        "summary_json = ?", "heal_count = ?",
+    ]
+    params: list = [status, now, duration, summary_json, heal_count]
+
+    if error_detail is not None:
+        updates.append("error_detail = ?")
+        params.append(error_detail[:4000])
+
+    if version_num is not None:
+        updates.append("version_num = ?")
+        params.append(version_num)
+
+    if semver:
+        updates.append("semver = ?")
+        params.append(semver)
+
+    if events_json is not None:
+        updates.append("pipeline_events_json = ?")
+        params.append(events_json)
+
+    # Persist the timestamp of the last progress event (for stuck detection post-mortem)
+    updates.append("last_event_at = ?")
+    params.append(last_event_at or now)
+
+    params.append(run_id)
+    await backend.execute_write(
+        f"UPDATE pipeline_runs SET {', '.join(updates)} WHERE run_id = ?",
+        tuple(params),
+    )
+
+
+async def cleanup_orphaned_pipeline_runs():
+    """Mark any 'running' pipeline runs as 'interrupted' on startup.
+
+    If the server restarts mid-pipeline, runs stay in 'running' forever.
+    This detects them and marks them 'interrupted' — a distinct status from
+    'failed' that signals the run is resumable.
+
+    Services are set to 'validation_interrupted' (not 'draft') so the UI
+    can offer a Resume button instead of losing all progress.
+    """
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT run_id, service_id FROM pipeline_runs WHERE status = 'running'", ()
+    )
+    if rows:
+        await backend.execute_write(
+            "UPDATE pipeline_runs SET status = 'interrupted', "
+            "error_detail = 'Server restarted — pipeline interrupted (resumable)' "
+            "WHERE status = 'running'", ()
+        )
+        logger.info(f"Marked {len(rows)} orphaned pipeline run(s) as interrupted")
+
+        # Set services to 'validation_interrupted' so the UI shows Resume
+        orphaned_svc_ids = list({r["service_id"] for r in rows if r.get("service_id")})
+        for svc_id in orphaned_svc_ids:
+            try:
+                svc_rows = await backend.execute(
+                    "SELECT status FROM services WHERE id = ?", (svc_id,)
+                )
+                if svc_rows and svc_rows[0].get("status") in ("validating", "onboarding"):
+                    await backend.execute_write(
+                        "UPDATE services SET status = 'interrupted', "
+                        "review_notes = ? WHERE id = ? AND status IN ('validating', 'onboarding')",
+                        (json.dumps({"validation_passed": False, "error": "Server restarted — pipeline can be resumed"}), svc_id),
+                    )
+                    logger.info(f"Marked service '{svc_id}' as interrupted (resumable)")
+            except Exception as e:
+                logger.debug(f"Failed to mark service '{svc_id}' as interrupted: {e}")
+
+
+async def has_running_pipeline(service_id: str) -> dict | None:
+    """Check whether a pipeline is already running for the given service/template.
+
+    Returns the running pipeline_run row if one exists, else None.
+    """
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT TOP 1 run_id, pipeline_type, started_at "
+        "FROM pipeline_runs WHERE service_id = ? AND status = 'running' "
+        "ORDER BY started_at DESC",
+        (service_id,),
+    )
+    return rows[0] if rows else None
+
+
+async def get_pipeline_runs(service_id: str, limit: int = 20, *, include_events: bool = True) -> list[dict]:
+    """Get recent pipeline runs for a service, newest first.
+
+    When include_events=False, the large pipeline_events_json column is
+    excluded from the query for much faster loading.
+    """
+    backend = await get_backend()
+    if include_events:
+        rows = await backend.execute(
+            f"SELECT TOP {limit} * FROM pipeline_runs WHERE service_id = ? ORDER BY started_at DESC",
+            (service_id,),
+        )
+    else:
+        rows = await backend.execute(
+            f"SELECT TOP {limit} id, run_id, service_id, pipeline_type, status, "
+            "version_num, semver, started_at, completed_at, duration_secs, "
+            "summary_json, error_detail, created_by, heal_count, "
+            "last_completed_step, resume_count "
+            "FROM pipeline_runs WHERE service_id = ? ORDER BY started_at DESC",
+            (service_id,),
+        )
+    for r in rows:
+        if isinstance(r.get("summary_json"), str):
+            try:
+                r["summary"] = json.loads(r["summary_json"])
+            except (json.JSONDecodeError, TypeError):
+                r["summary"] = {}
+        if include_events:
+            if isinstance(r.get("pipeline_events_json"), str):
+                try:
+                    r["events"] = json.loads(r["pipeline_events_json"])
+                except (json.JSONDecodeError, TypeError):
+                    r["events"] = []
+            else:
+                r["events"] = []
+        else:
+            r["events"] = []
+    return rows
+
+
+async def get_latest_pipeline_runs_batch(service_ids: list[str]) -> dict[str, dict]:
+    """Get the latest pipeline run for each service ID in one query.
+
+    Returns a dict mapping service_id -> latest run (without events).
+    Uses ROW_NUMBER to pick the newest run per service efficiently.
+    """
+    if not service_ids:
+        return {}
+    backend = await get_backend()
+    placeholders = ",".join("?" for _ in service_ids)
+    rows = await backend.execute(
+        f"SELECT * FROM ("
+        f"  SELECT id, run_id, service_id, pipeline_type, status, "
+        f"  version_num, semver, started_at, completed_at, duration_secs, "
+        f"  summary_json, error_detail, created_by, heal_count, "
+        f"  last_completed_step, resume_count, "
+        f"  ROW_NUMBER() OVER (PARTITION BY service_id ORDER BY started_at DESC) AS rn "
+        f"  FROM pipeline_runs WHERE service_id IN ({placeholders})"
+        f") ranked WHERE rn = 1",
+        tuple(service_ids),
+    )
+    result: dict[str, dict] = {}
+    for r in rows:
+        if isinstance(r.get("summary_json"), str):
+            try:
+                r["summary"] = json.loads(r["summary_json"])
+            except (json.JSONDecodeError, TypeError):
+                r["summary"] = {}
+        r["events"] = []
+        r.pop("rn", None)
+        result[r["service_id"]] = r
+    return result
+
+
+async def get_all_template_validation_runs(limit: int = 50) -> list[dict]:
+    """Get recent template validation pipeline runs across ALL templates, newest first.
+
+    Identifies template runs by joining on catalog_templates (service_id = template id).
+    """
+    backend = await get_backend()
+    rows = await backend.execute(
+        f"SELECT TOP {int(limit)} pr.*, ct.name AS template_name "
+        "FROM pipeline_runs pr "
+        "INNER JOIN catalog_templates ct ON pr.service_id = ct.id "
+        "ORDER BY pr.started_at DESC",
+        (),
+    )
+    for r in rows:
+        if isinstance(r.get("summary_json"), str):
+            try:
+                r["summary"] = json.loads(r["summary_json"])
+            except (json.JSONDecodeError, TypeError):
+                r["summary"] = {}
+        if isinstance(r.get("pipeline_events_json"), str):
+            try:
+                r["events"] = json.loads(r["pipeline_events_json"])
+            except (json.JSONDecodeError, TypeError):
+                r["events"] = []
+        else:
+            r["events"] = []
+    return rows
+
+
+async def get_step_invocations(step_name: str | None = None, limit: int = 10) -> list[dict]:
+    """Get recent step invocations across all pipeline runs.
+
+    Joins pipeline_checkpoints with pipeline_runs to provide full context
+    for each step execution including the correlation run_id, service name,
+    and overall run status.
+
+    If step_name is provided, returns invocations for that specific step.
+    Otherwise returns invocations grouped by step name.
+    """
+    backend = await get_backend()
+    if step_name:
+        rows = await backend.execute(
+            f"SELECT TOP {int(limit)} "
+            "  cp.run_id, cp.step_name, cp.step_index, cp.status AS step_status, "
+            "  cp.artifacts_json, cp.completed_at, cp.duration_secs, "
+            "  pr.service_id, pr.pipeline_type, pr.status AS run_status, "
+            "  pr.started_at AS run_started_at, pr.completed_at AS run_completed_at, "
+            "  pr.heal_count, pr.error_detail, pr.semver, "
+            "  s.name AS service_name "
+            "FROM pipeline_checkpoints cp "
+            "JOIN pipeline_runs pr ON cp.run_id = pr.run_id "
+            "LEFT JOIN services s ON pr.service_id = s.id "
+            "WHERE cp.step_name = ? "
+            "ORDER BY cp.completed_at DESC",
+            (step_name,),
+        )
+    else:
+        rows = await backend.execute(
+            f"SELECT TOP {int(limit) * 12} "
+            "  cp.run_id, cp.step_name, cp.step_index, cp.status AS step_status, "
+            "  cp.artifacts_json, cp.completed_at, cp.duration_secs, "
+            "  pr.service_id, pr.pipeline_type, pr.status AS run_status, "
+            "  pr.started_at AS run_started_at, pr.completed_at AS run_completed_at, "
+            "  pr.heal_count, pr.error_detail, pr.semver, "
+            "  s.name AS service_name "
+            "FROM pipeline_checkpoints cp "
+            "JOIN pipeline_runs pr ON cp.run_id = pr.run_id "
+            "LEFT JOIN services s ON pr.service_id = s.id "
+            "ORDER BY cp.completed_at DESC",
+            (),
+        )
+
+    for r in rows:
+        if isinstance(r.get("artifacts_json"), str):
+            try:
+                r["artifacts"] = json.loads(r["artifacts_json"])
+            except (json.JSONDecodeError, TypeError):
+                r["artifacts"] = {}
+        else:
+            r["artifacts"] = {}
+        # Remove raw JSON field from response
+        r.pop("artifacts_json", None)
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════
+# PIPELINE CHECKPOINTS — Step-level persistence for resumability
+# ══════════════════════════════════════════════════════════════
+
+async def save_pipeline_checkpoint(
+    run_id: str,
+    step_name: str,
+    step_index: int,
+    status: str = "completed",
+    artifacts_json: str | None = None,
+    duration_secs: float | None = None,
+) -> None:
+    """Save a checkpoint after a pipeline step completes.
+
+    This is called automatically by the PipelineRunner after each step.
+    The artifacts_json captures the serializable output of the step
+    (template state, RG name, heal history, etc.) that's needed for resume.
+    """
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """INSERT INTO pipeline_checkpoints
+           (run_id, step_name, step_index, status, artifacts_json,
+            completed_at, duration_secs)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (run_id, step_name, step_index, status,
+         artifacts_json or "{}", now, duration_secs),
+    )
+
+
+async def save_pipeline_context(
+    run_id: str,
+    last_completed_step: int,
+    context_json: str,
+) -> None:
+    """Update the pipeline run with the latest checkpoint context.
+
+    The context_json is a serialized PipelineContext snapshot that
+    contains everything needed to resume the pipeline from the next step.
+    """
+    backend = await get_backend()
+    await backend.execute_write(
+        """UPDATE pipeline_runs
+           SET last_completed_step = ?, checkpoint_context_json = ?
+           WHERE run_id = ?""",
+        (last_completed_step, context_json, run_id),
+    )
+
+
+async def get_pipeline_checkpoint(run_id: str) -> dict | None:
+    """Get the latest checkpoint for a pipeline run.
+
+    Returns a dict with:
+      - run row (status, pipeline_type, service_id, last_completed_step, etc.)
+      - checkpoint_context (parsed from checkpoint_context_json)
+      - checkpoints (list of completed step checkpoints)
+
+    Returns None if the run doesn't exist or has no checkpoint.
+    """
+    backend = await get_backend()
+
+    # Get the run itself
+    rows = await backend.execute(
+        "SELECT * FROM pipeline_runs WHERE run_id = ?", (run_id,)
+    )
+    if not rows:
+        return None
+    run = rows[0]
+
+    if run.get("last_completed_step") is None:
+        return None  # No checkpoint saved yet
+
+    # Parse checkpoint context
+    ctx_json = run.get("checkpoint_context_json", "{}")
+    try:
+        checkpoint_context = json.loads(ctx_json) if isinstance(ctx_json, str) else {}
+    except (json.JSONDecodeError, TypeError):
+        checkpoint_context = {}
+
+    # Get step checkpoints
+    checkpoints = await backend.execute(
+        "SELECT * FROM pipeline_checkpoints WHERE run_id = ? ORDER BY step_index",
+        (run_id,),
+    )
+    for cp in checkpoints:
+        if isinstance(cp.get("artifacts_json"), str):
+            try:
+                cp["artifacts"] = json.loads(cp["artifacts_json"])
+            except (json.JSONDecodeError, TypeError):
+                cp["artifacts"] = {}
+
+    return {
+        "run": run,
+        "checkpoint_context": checkpoint_context,
+        "checkpoints": checkpoints,
+    }
+
+
+async def get_resumable_runs(service_id: str | None = None) -> list[dict]:
+    """Get pipeline runs that can be resumed (status='interrupted').
+
+    Optionally filter by service_id. Returns runs with their checkpoint context.
+    """
+    backend = await get_backend()
+    if service_id:
+        rows = await backend.execute(
+            "SELECT * FROM pipeline_runs WHERE status = 'interrupted' "
+            "AND service_id = ? ORDER BY started_at DESC",
+            (service_id,),
+        )
+    else:
+        rows = await backend.execute(
+            "SELECT * FROM pipeline_runs WHERE status = 'interrupted' "
+            "ORDER BY started_at DESC", ()
+        )
+
+    for r in rows:
+        if isinstance(r.get("checkpoint_context_json"), str):
+            try:
+                r["checkpoint_context"] = json.loads(r["checkpoint_context_json"])
+            except (json.JSONDecodeError, TypeError):
+                r["checkpoint_context"] = {}
+        else:
+            r["checkpoint_context"] = {}
+    return rows
+
+
+async def mark_pipeline_resuming(run_id: str) -> None:
+    """Transition an interrupted pipeline run back to 'running' for resume."""
+    backend = await get_backend()
+    await backend.execute_write(
+        "UPDATE pipeline_runs SET status = 'running', "
+        "resume_count = ISNULL(resume_count, 0) + 1, "
+        "error_detail = NULL "
+        "WHERE run_id = ? AND status = 'interrupted'",
+        (run_id,),
+    )
+
+
+async def delete_pipeline_checkpoints(run_id: str) -> None:
+    """Delete all checkpoints for a pipeline run (used on fresh retry)."""
+    backend = await get_backend()
+    await backend.execute_write(
+        "DELETE FROM pipeline_checkpoints WHERE run_id = ?", (run_id,)
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# GOVERNANCE REVIEWS
+# ══════════════════════════════════════════════════════════════
+
+async def save_governance_review(
+    service_id: str,
+    version: int,
+    review: dict,
+    *,
+    semver: str | None = None,
+    pipeline_type: str = "onboarding",
+    run_id: str | None = None,
+    gate_decision: str | None = None,
+    gate_reason: str | None = None,
+    created_by: str | None = None,
+) -> None:
+    """Persist a single governance review (CISO or CTO) to the database."""
+    backend = await get_backend()
+    findings_json = json.dumps(review.get("findings", []), default=str)
+    await backend.execute(
+        """INSERT INTO governance_reviews
+           (service_id, version, semver, pipeline_type, run_id,
+            agent, verdict, confidence, summary, findings_json,
+            risk_score, architecture_score, security_posture, cost_assessment,
+            gate_decision, gate_reason, model_used, reviewed_at, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            service_id,
+            version,
+            semver,
+            pipeline_type,
+            run_id,
+            review.get("agent", "unknown"),
+            review.get("verdict", "unknown"),
+            review.get("confidence", 0),
+            (review.get("summary") or "")[:4000],
+            findings_json,
+            review.get("risk_score"),
+            review.get("architecture_score"),
+            review.get("security_posture"),
+            review.get("cost_assessment"),
+            gate_decision,
+            gate_reason,
+            review.get("model_used"),
+            review.get("reviewed_at", ""),
+            created_by,
+        ),
+    )
+
+
+async def get_governance_reviews(
+    service_id: str,
+    version: int | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Get governance reviews for a service, optionally filtered by version."""
+    backend = await get_backend()
+    if version is not None:
+        rows = await backend.execute(
+            f"SELECT TOP {limit} * FROM governance_reviews "
+            "WHERE service_id = ? AND version = ? ORDER BY id DESC",
+            (service_id, version),
+        )
+    else:
+        rows = await backend.execute(
+            f"SELECT TOP {limit} * FROM governance_reviews "
+            "WHERE service_id = ? ORDER BY id DESC",
+            (service_id,),
+        )
+    for r in rows:
+        if isinstance(r.get("findings_json"), str):
+            try:
+                r["findings"] = json.loads(r["findings_json"])
+            except (json.JSONDecodeError, TypeError):
+                r["findings"] = []
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════
+# ORCHESTRATION PROCESS HELPERS
+# ══════════════════════════════════════════════════════════════
+
+async def get_process(process_id: str) -> dict | None:
+    """Get a process definition with its steps."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM orchestration_processes WHERE id = ?",
+        (process_id,),
+    )
+    if not rows:
+        return None
+    proc = dict(rows[0])
+    steps = await backend.execute(
+        "SELECT * FROM process_steps WHERE process_id = ? ORDER BY step_order",
+        (process_id,),
+    )
+    proc["steps"] = [dict(s) for s in steps]
+    return proc
+
+
+async def get_all_processes() -> list[dict]:
+    """Get all orchestration processes."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM orchestration_processes ORDER BY id", ()
+    )
+    result = []
+    for row in rows:
+        proc = dict(row)
+        steps = await backend.execute(
+            "SELECT * FROM process_steps WHERE process_id = ? ORDER BY step_order",
+            (proc["id"],),
+        )
+        proc["steps"] = [dict(s) for s in steps]
+        result.append(proc)
+    return result
+
+
+async def seed_orchestration_processes() -> int:
+    """Seed the orchestration processes, replacing stale definitions.
+
+    Compares the step count for known processes against the in-code
+    definitions.  If any process is missing or has the wrong number
+    of steps, the **entire set** is deleted and re-inserted so every
+    process + step stays in sync with the codebase.
+    """
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    processes = [
+        # ─────────────────────────────────────────────────────
+        # 1. SERVICE ONBOARDING
+        # ─────────────────────────────────────────────────────
+        {
+            "id": "service_onboarding",
+            "name": "Service Onboarding",
+            "description": (
+                "End-to-end process for bringing a new Azure service into the "
+                "approved catalog. Configures model routing, fetches org standards, "
+                "plans architecture via LLM, generates ARM + Azure Policy, validates "
+                "with a full healing loop, deploys policy, and promotes to approved."
+            ),
+            "trigger_event": "service_requested",
+            "steps": [
+                {
+                    "step_order": 1,
+                    "name": "Initialize",
+                    "description": (
+                        "Configure per-task model routing (planning, code_generation, "
+                        "code_fixing, policy_gen, analysis). Clean up stale draft/failed "
+                        "versions from previous runs."
+                    ),
+                    "action": "initialize",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 2,
+                    "name": "Check dependency gates",
+                    "description": (
+                        "Inspect all required external dependencies of this service type. "
+                        "For each dependency that exists only as a prepped draft "
+                        "(reviewed_by in {'orchestrator','auto_prepped'}, no validated_at), run the full "
+                        "onboarding pipeline inline before proceeding. Skip dependencies "
+                        "that are created_by_template (inline), optional, or already "
+                        "fully validated (reviewed_by='Deployment Validated')."
+                    ),
+                    "action": "check_dependency_gates",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 3,
+                    "name": "Analyze organization standards",
+                    "description": (
+                        "Fetch applicable organization standards for the service type. "
+                        "Build ARM generation context and policy generation context. "
+                        "If use_version is set, load existing draft and skip generation."
+                    ),
+                    "action": "analyze_standards",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 4,
+                    "name": "Plan architecture",
+                    "description": (
+                        "LLM planning call to reason about ARM template structure, "
+                        "security config, parameters, and standards compliance. "
+                        "Produces a structured plan handed to the code generation model."
+                    ),
+                    "action": "plan_architecture",
+                    "on_success": "next",
+                    "on_failure": "next",
+                    "config_json": '{"skippable": true}',
+                },
+                {
+                    "step_order": 5,
+                    "name": "Generate ARM template",
+                    "description": (
+                        "Generate ARM template via Copilot SDK. "
+                        "Sanitize, inject standard tags, stamp metadata. "
+                        "Create service version with status=validating."
+                    ),
+                    "action": "generate_arm",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 6,
+                    "name": "Generate Azure Policy",
+                    "description": (
+                        "Generate Azure Policy definition via LLM or deterministic "
+                        "fallback. Policy will be tested against deployed resources "
+                        "during validation and deployed to Azure after."
+                    ),
+                    "action": "generate_policy",
+                    "on_success": "next",
+                    "on_failure": "next",
+                    "config_json": '{"skippable": true}',
+                },
+                {
+                    "step_order": 7,
+                    "name": "Governance review gate",
+                    "description": (
+                        "Run CISO and CTO structured reviews on the generated ARM "
+                        "template in parallel. CISO reviews security and compliance "
+                        "(can block); CTO reviews architecture and cost (advisory). "
+                        "Results are persisted to governance_reviews table."
+                    ),
+                    "action": "governance_review",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                    "config_json": '{"skippable": false}',
+                },
+                {
+                    "step_order": 8,
+                    "name": "Validate via ARM deploy",
+                    "description": (
+                        "Full healing loop: parse JSON → static policy check → "
+                        "What-If → deploy → resource verification → runtime policy "
+                        "compliance. Up to max_heal_attempts iterations with LLM "
+                        "two-phase healing (analyze root cause, then fix)."
+                    ),
+                    "action": "validate_arm_deploy",
+                    "on_success": "next",
+                    "on_failure": "mark_failed",
+                    "config_json": '{"max_heal_attempts": 5}',
+                },
+                {
+                    "step_order": 9,
+                    "name": "Infrastructure smoke tests",
+                    "description": (
+                        "Generate and execute Python infrastructure tests against the "
+                        "live validation resources using the Copilot SDK. Tests verify "
+                        "endpoint reachability, provisioning state, security config, "
+                        "and tag compliance. Retries transient failures and analyzes "
+                        "root causes of persistent issues."
+                    ),
+                    "action": "infra_testing",
+                    "on_success": "next",
+                    "on_failure": "next",
+                    "config_json": '{"skippable": true}',
+                },
+                {
+                    "step_order": 10,
+                    "name": "Deploy Azure Policy",
+                    "description": (
+                        "Deploy the generated Azure Policy definition to enforce "
+                        "governance on the service's resource type. Non-blocking — "
+                        "failure does not abort the pipeline."
+                    ),
+                    "action": "deploy_policy",
+                    "on_success": "next",
+                    "on_failure": "next",
+                },
+                {
+                    "step_order": 11,
+                    "name": "Cleanup",
+                    "description": (
+                        "Delete the temporary validation resource group and clean up "
+                        "Azure Policy artifacts (definition + assignment)."
+                    ),
+                    "action": "cleanup",
+                    "on_success": "next",
+                    "on_failure": "next",
+                },
+                {
+                    "step_order": 12,
+                    "name": "Approve and promote",
+                    "description": (
+                        "Mark service version as approved, set as active version. "
+                        "Emit final summary with resource count, policy results, "
+                        "heal history, and promotion status."
+                    ),
+                    "action": "promote_service",
+                    "on_success": "done",
+                    "on_failure": "abort",
+                },
+            ],
+        },
+        # ─────────────────────────────────────────────────────
+        # 2. TEMPLATE COMPOSITION
+        # ─────────────────────────────────────────────────────
+        {
+            "id": "template_composition",
+            "name": "Template Composition",
+            "description": (
+                "Compose a multi-service ARM template from approved services. "
+                "Resolves dependencies, auto-onboards missing services, "
+                "and validates the composed template."
+            ),
+            "trigger_event": "compose_requested",
+            "steps": [
+                {
+                    "step_order": 1,
+                    "name": "Gather selected services",
+                    "description": (
+                        "For each selected service, fetch its active ARM template version. "
+                        "If none exists, fall back to an AI-generated draft version when available."
+                    ),
+                    "action": "gather_service_templates",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 2,
+                    "name": "Resolve dependencies",
+                    "description": (
+                        "Use analyze_dependencies to check what resources the selected "
+                        "services require. For each REQUIRED dependency (required=True) "
+                        "that is NOT provided by any selected service and is NOT "
+                        "created_by_template: check if it's in the catalog. "
+                        "If approved → auto-add to the composition. "
+                        "If not in catalog → trigger service_onboarding sub-process. "
+                        "Skip optional dependencies (just report them)."
+                    ),
+                    "action": "resolve_dependencies",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                    "config_json": '{"auto_add_required": true, "onboard_missing": true}',
+                },
+                {
+                    "step_order": 3,
+                    "name": "Compose ARM template",
+                    "description": (
+                        "Merge all service ARM templates into a single composed template. "
+                        "Remap ALL parameters (standard get shared, non-standard get "
+                        "suffixed per service). Replace ALL parameter references in "
+                        "resources AND outputs, including bare references inside "
+                        "compound ARM expressions like resourceId()."
+                    ),
+                    "action": "compose_template",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 4,
+                    "name": "Save as draft",
+                    "description": (
+                        "Save the composed template to catalog_templates and "
+                        "create version 1 as a draft. Include dependency analysis "
+                        "metadata (provides, requires, optional_refs, template_type)."
+                    ),
+                    "action": "save_template",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 5,
+                    "name": "Run structural tests",
+                    "description": (
+                        "Run the template test suite: JSON structure, schema compliance, "
+                        "parameter validation, resource validation, output validation, "
+                        "dependency check, tag compliance. Template must pass all tests."
+                    ),
+                    "action": "run_template_tests",
+                    "on_success": "next",
+                    "on_failure": "heal_and_retry",
+                },
+                {
+                    "step_order": 6,
+                    "name": "Validate via ARM deploy",
+                    "description": (
+                        "Deploy to a temp resource group with What-If + actual deploy. "
+                        "If it fails, run the self-heal loop (surface heal first, "
+                        "deep heal after 3 attempts for blueprints). "
+                        "Save each successful fix as a new version."
+                    ),
+                    "action": "validate_arm_deploy",
+                    "on_success": "next",
+                    "on_failure": "mark_failed",
+                    "config_json": '{"max_heal_attempts": 5, "deep_heal_after": 3}',
+                },
+                {
+                    "step_order": 7,
+                    "name": "Promote to approved",
+                    "description": (
+                        "Set template status='approved', update active_version. "
+                        "The template is now available for deployment."
+                    ),
+                    "action": "promote_template",
+                    "on_success": "done",
+                    "on_failure": "abort",
+                },
+            ],
+        },
+        # ─────────────────────────────────────────────────────
+        # 3. DEPENDENCY RESOLUTION
+        # ─────────────────────────────────────────────────────
+        {
+            "id": "dependency_resolution",
+            "name": "Dependency Resolution",
+            "description": (
+                "Sub-process invoked during template composition when a required "
+                "dependency is missing. Finds or creates the missing service, "
+                "then adds it to the composition."
+            ),
+            "trigger_event": "dependency_missing",
+            "steps": [
+                {
+                    "step_order": 1,
+                    "name": "Check catalog for service",
+                    "description": (
+                        "Query get_service(resource_type) to see if the service "
+                        "exists in the catalog. If approved → use it. "
+                        "If under_review or not_approved → attempt onboarding."
+                    ),
+                    "action": "check_service_exists",
+                    "on_success": "step_4",
+                    "on_failure": "next",
+                },
+                {
+                    "step_order": 2,
+                    "name": "Auto-onboard service",
+                    "description": (
+                        "Run the service_onboarding process for the missing resource type. "
+                        "This creates the service, generates ARM, validates, and promotes. "
+                        "If onboarding fails, report the gap and continue without it."
+                    ),
+                    "action": "run_service_onboarding",
+                    "on_success": "next",
+                    "on_failure": "report_gap",
+                },
+                {
+                    "step_order": 3,
+                    "name": "Verify onboarded service",
+                    "description": (
+                        "Confirm the service is now approved with an active ARM template. "
+                        "If not, it means onboarding failed — skip this dependency."
+                    ),
+                    "action": "verify_service_approved",
+                    "on_success": "next",
+                    "on_failure": "skip",
+                },
+                {
+                    "step_order": 4,
+                    "name": "Add to composition",
+                    "description": (
+                        "Add the resolved service to the composition's service list. "
+                        "Fetch its ARM template and include it in the merge."
+                    ),
+                    "action": "add_to_composition",
+                    "on_success": "done",
+                    "on_failure": "abort",
+                },
+            ],
+        },
+        # ─────────────────────────────────────────────────────
+        # 4. DEEP HEALING
+        # ─────────────────────────────────────────────────────
+        {
+            "id": "deep_healing",
+            "name": "Deep Healing",
+            "description": (
+                "Escalation process when surface healing of a blueprint template "
+                "fails repeatedly. Identifies the broken service, fixes it "
+                "standalone, validates it, promotes it, and recomposes the parent."
+            ),
+            "trigger_event": "surface_heal_exhausted",
+            "steps": [
+                {
+                    "step_order": 1,
+                    "name": "Identify culprit service",
+                    "description": (
+                        "Analyze the ARM error to determine which service's resources "
+                        "are causing the failure. Use the LLM to map the error to a "
+                        "service_id from the blueprint's service_ids list."
+                    ),
+                    "action": "identify_culprit",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 2,
+                    "name": "Fix culprit template",
+                    "description": (
+                        "Extract the culprit service's ARM template. Send it to the "
+                        "LLM with the error context and have it fix the template. "
+                        "Save the fix as a new service version."
+                    ),
+                    "action": "heal_service_template",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 3,
+                    "name": "Validate fix standalone",
+                    "description": (
+                        "Deploy the fixed service template standalone to a temp RG. "
+                        "If it fails, go back to step 2 (re-heal). Max 3 re-heals."
+                    ),
+                    "action": "validate_service_standalone",
+                    "on_success": "next",
+                    "on_failure": "step_2",
+                    "config_json": '{"max_retries": 3}',
+                },
+                {
+                    "step_order": 4,
+                    "name": "Promote fixed service",
+                    "description": (
+                        "Promote the validated service version: set status='validated', "
+                        "update active_version. Run promote_service_after_validation."
+                    ),
+                    "action": "promote_service",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 5,
+                    "name": "Recompose parent blueprint",
+                    "description": (
+                        "Re-run the composition logic using the fixed service templates. "
+                        "This uses the same compose logic with proper parameter remapping. "
+                        "Save the recomposed template as a new version."
+                    ),
+                    "action": "recompose_blueprint",
+                    "on_success": "done",
+                    "on_failure": "abort",
+                },
+            ],
+        },
+        # ─────────────────────────────────────────────────────
+        # 5. TEMPLATE VALIDATION (10-step pipeline)
+        # ─────────────────────────────────────────────────────
+        {
+            "id": "template_validation",
+            "name": "Template Validation",
+            "description": (
+                "Full lifecycle validation of a template: recompose, "
+                "structural tests, ARM deploy with self-heal, infra testing, "
+                "and promotion. 10 named steps."
+            ),
+            "trigger_event": "validation_requested",
+            "steps": [
+                {
+                    "step_order": 1,
+                    "name": "Initialize",
+                    "description": (
+                        "Load template, conflict check, create pipeline run, "
+                        "configure model routing."
+                    ),
+                    "action": "initialize_template",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 2,
+                    "name": "Recompose / Verify",
+                    "description": (
+                        "Blueprint: recompose from pinned service versions. "
+                        "Standalone: verify template content is loaded."
+                    ),
+                    "action": "recompose_template",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 3,
+                    "name": "Structural Test",
+                    "description": (
+                        "Run the 7-category structural test suite: JSON, "
+                        "schema, parameters, resources, outputs, tags, naming."
+                    ),
+                    "action": "structural_test",
+                    "on_success": "next",
+                    "on_failure": "next",
+                },
+                {
+                    "step_order": 4,
+                    "name": "Auto-Heal Structural",
+                    "description": (
+                        "Fix structural failures from step 3 using LLM "
+                        "(CODE_FIXING). Re-runs structural tests after fix."
+                    ),
+                    "action": "auto_heal_structural",
+                    "on_success": "next",
+                    "on_failure": "next",
+                },
+                {
+                    "step_order": 5,
+                    "name": "Pre-Validate ARM",
+                    "description": (
+                        "Validate ARM references and expression syntax. "
+                        "Auto-fix missing variable/parameter references."
+                    ),
+                    "action": "pre_validate_arm",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 6,
+                    "name": "Check Availability",
+                    "description": (
+                        "Check Azure VM quota in target region. Switch to "
+                        "fallback region if capacity is exceeded."
+                    ),
+                    "action": "check_availability",
+                    "on_success": "next",
+                    "on_failure": "abort",
+                },
+                {
+                    "step_order": 7,
+                    "name": "ARM Deploy",
+                    "description": (
+                        "Deploy to a temporary resource group with self-healing "
+                        "loop (up to 5 attempts). Deep heal for blueprints."
+                    ),
+                    "action": "arm_deploy_template",
+                    "on_success": "next",
+                    "on_failure": "mark_failed",
+                    "config_json": '{"max_heal_attempts": 5}',
+                },
+                {
+                    "step_order": 8,
+                    "name": "Infra Testing",
+                    "description": (
+                        "Generate and run AI-powered infrastructure smoke "
+                        "tests against the deployed resources."
+                    ),
+                    "action": "infra_testing_template",
+                    "on_success": "next",
+                    "on_failure": "next",
+                },
+                {
+                    "step_order": 9,
+                    "name": "Cleanup",
+                    "description": (
+                        "Delete the temporary validation resource group."
+                    ),
+                    "action": "cleanup_template",
+                    "on_success": "next",
+                    "on_failure": "next",
+                },
+                {
+                    "step_order": 10,
+                    "name": "Promote Template",
+                    "description": (
+                        "Save validated version, update template status to "
+                        "'validated', complete pipeline run."
+                    ),
+                    "action": "promote_template",
+                    "on_success": "done",
+                    "on_failure": "abort",
+                },
+            ],
+        },
+    ]
+
+    count = 0
+
+    # ── Staleness check: compare expected vs actual step counts ──
+    expected_counts = {p["id"]: len(p["steps"]) for p in processes}
+    needs_reseed = False
+
+    existing = await backend.execute(
+        "SELECT COUNT(*) as cnt FROM orchestration_processes", ()
+    )
+    if not existing or existing[0]["cnt"] == 0:
+        needs_reseed = True
+    else:
+        for proc_id, expected_step_count in expected_counts.items():
+            rows = await backend.execute(
+                "SELECT COUNT(*) as cnt FROM process_steps WHERE process_id = ?",
+                (proc_id,),
+            )
+            actual = rows[0]["cnt"] if rows else 0
+            if actual != expected_step_count:
+                logger.info(
+                    f"Process '{proc_id}' has {actual} steps in DB, "
+                    f"expected {expected_step_count} — will re-seed"
+                )
+                needs_reseed = True
+                break
+
+    if not needs_reseed:
+        return 0
+
+    # Clear stale data before inserting fresh definitions
+    await backend.execute_write("DELETE FROM process_steps", ())
+    await backend.execute_write("DELETE FROM orchestration_processes", ())
+
+    for proc in processes:
+        steps = proc.pop("steps")
+        await backend.execute_write(
+            """INSERT INTO orchestration_processes
+               (id, name, description, trigger_event, enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 1, ?, ?)""",
+            (proc["id"], proc["name"], proc["description"],
+             proc["trigger_event"], now, now),
+        )
+        for step in steps:
+            await backend.execute_write(
+                """INSERT INTO process_steps
+                   (process_id, step_order, name, description, action,
+                    condition_json, on_success, on_failure, config_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (proc["id"], step["step_order"], step["name"],
+                 step["description"], step["action"],
+                 step.get("condition_json", "{}"),
+                 step.get("on_success", "next"),
+                 step.get("on_failure", "abort"),
+                 step.get("config_json", "{}")),
+            )
+        count += 1
+
+    logger.info(f"Seeded {count} orchestration processes")
+    return count
+
+
+async def refresh_orchestration_processes() -> int:
+    """Drop and re-seed all orchestration processes from the Python source of truth.
+
+    Unlike ``seed_orchestration_processes`` (which skips if data exists),
+    this always replaces existing definitions.  Use this after updating
+    the process definitions in code so running databases pick up the
+    new step definitions.
+
+    Returns the number of processes seeded.
+    """
+    backend = await get_backend()
+
+    # Delete all existing steps and processes (steps first due to FK)
+    await backend.execute_write("DELETE FROM process_steps", ())
+    await backend.execute_write("DELETE FROM orchestration_processes", ())
+    logger.info("Cleared existing orchestration process definitions")
+
+    # Re-seed with current definitions
+    return await seed_orchestration_processes()
+
+
+# ══════════════════════════════════════════════════════════════
+# AGENT DEFINITIONS — DB-backed agent specs
+# ══════════════════════════════════════════════════════════════
+
+async def seed_agent_definitions() -> int:
+    """Seed agent definitions from the hardcoded registry in agents.py.
+
+    Uses an upsert strategy:
+    - Missing agents are inserted.
+    - Existing agents at version 1 (never user-edited) are updated if the
+      hardcoded prompt has changed, so code-side prompt improvements
+      propagate automatically on restart.
+    - Existing agents at version > 1 (user-edited via UI) are left alone
+      so platform-engineer customisations are preserved.
+
+    Returns the number of agents inserted or updated.
+    """
+    import hashlib
+    from src.agents import _HARDCODED_AGENTS
+
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+
+    # Categorise agents for the category column
+    interactive_ids = {"web_chat", "ciso_advisor", "concierge", "governance_agent"}
+
+    for agent_id, spec in _HARDCODED_AGENTS.items():
+        category = "interactive" if agent_id in interactive_ids else "headless"
+        prompt_hash = hashlib.sha256(spec.system_prompt.encode()).hexdigest()[:16]
+
+        existing = await backend.execute(
+            "SELECT id, version, system_prompt FROM agent_definitions WHERE id = ?",
+            (agent_id,),
+        )
+        if existing:
+            row = existing[0]
+            db_version = row.get("version", 1) if isinstance(row, dict) else row[1]
+            db_prompt = (row.get("system_prompt", "") if isinstance(row, dict)
+                         else row[2]) or ""
+            # Only update if never user-edited (version 1) and prompt differs
+            if db_version <= 1 and db_prompt != spec.system_prompt:
+                await backend.execute_write(
+                    """UPDATE agent_definitions
+                       SET name = ?, description = ?, system_prompt = ?,
+                           task = ?, timeout = ?, category = ?, updated_at = ?
+                       WHERE id = ? AND version <= 1""",
+                    (spec.name, spec.description, spec.system_prompt,
+                     spec.task.value, spec.timeout, category, now, agent_id),
+                )
+                count += 1
+                logger.info(f"Updated stale agent definition: {agent_id}")
+            continue
+
+        await backend.execute_write(
+            """INSERT INTO agent_definitions
+               (id, name, description, system_prompt, task, timeout,
+                category, enabled, version, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)""",
+            (agent_id, spec.name, spec.description, spec.system_prompt,
+             spec.task.value, spec.timeout, category, now, now),
+        )
+        count += 1
+
+    if count:
+        logger.info(f"Seeded/updated {count} agent definitions in database")
+    return count
+
+
+async def get_all_agent_definitions() -> list[dict]:
+    """Return all agent definitions from the database."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM agent_definitions ORDER BY category, name", ()
+    )
+    return [dict(r) for r in rows] if rows else []
+
+
+async def get_agent_definition(agent_id: str) -> dict | None:
+    """Return a single agent definition by ID."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM agent_definitions WHERE id = ?", (agent_id,)
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def update_agent_definition(
+    agent_id: str,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    system_prompt: str | None = None,
+    task: str | None = None,
+    timeout: int | None = None,
+    enabled: bool | None = None,
+    changed_by: str = "user",
+) -> dict | None:
+    """Update an agent definition. Creates a prompt history entry on prompt changes."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+
+    current = await get_agent_definition(agent_id)
+    if not current:
+        return None
+
+    # Build SET clauses for fields that changed
+    updates: list[str] = []
+    params: list[object] = []
+
+    if name is not None:
+        updates.append("name = ?")
+        params.append(name)
+    if description is not None:
+        updates.append("description = ?")
+        params.append(description)
+    if task is not None:
+        updates.append("task = ?")
+        params.append(task)
+    if timeout is not None:
+        updates.append("timeout = ?")
+        params.append(timeout)
+    if enabled is not None:
+        updates.append("enabled = ?")
+        params.append(1 if enabled else 0)
+
+    # Prompt change — bump version and record history
+    if system_prompt is not None and system_prompt != current.get("system_prompt"):
+        new_version = (current.get("version") or 1) + 1
+        updates.append("system_prompt = ?")
+        params.append(system_prompt)
+        updates.append("version = ?")
+        params.append(new_version)
+
+        await backend.execute_write(
+            """INSERT INTO agent_prompt_history
+               (agent_id, version, system_prompt, changed_by, changed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (agent_id, new_version, system_prompt, changed_by, now),
+        )
+
+    if not updates:
+        return current
+
+    updates.append("updated_at = ?")
+    params.append(now)
+    params.append(agent_id)
+
+    await backend.execute_write(
+        f"UPDATE agent_definitions SET {', '.join(updates)} WHERE id = ?",
+        tuple(params),
+    )
+    return await get_agent_definition(agent_id)
+
+
+async def get_agent_prompt_history(agent_id: str) -> list[dict]:
+    """Return prompt version history for an agent."""
+    backend = await get_backend()
+    rows = await backend.execute(
+        "SELECT * FROM agent_prompt_history WHERE agent_id = ? ORDER BY version DESC",
+        (agent_id,),
+    )
+    return [dict(r) for r in rows] if rows else []
+
+
+async def reset_agent_to_default(agent_id: str) -> dict | None:
+    """Reset an agent's prompt to the hardcoded default."""
+    from src.agents import _HARDCODED_AGENTS
+
+    spec = _HARDCODED_AGENTS.get(agent_id)
+    if not spec:
+        return None
+
+    return await update_agent_definition(
+        agent_id,
+        system_prompt=spec.system_prompt,
+        changed_by="system_reset",
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# AGENT MISSES — recording & querying
+# ══════════════════════════════════════════════════════════════
+
+async def insert_agent_miss(
+    agent_name: str,
+    miss_type: str,
+    *,
+    context_summary: str = "",
+    error_detail: str = "",
+    input_preview: str = "",
+    output_preview: str = "",
+    pipeline_phase: str | None = None,
+) -> int | None:
+    """Record a miss event for an agent. Returns the new row id."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """INSERT INTO agent_misses
+           (agent_name, miss_type, context_summary, error_detail,
+            input_preview, output_preview, pipeline_phase, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (agent_name, miss_type,
+         (context_summary or "")[:4000], (error_detail or "")[:4000],
+         (input_preview or "")[:1000], (output_preview or "")[:1000],
+         pipeline_phase, now),
+    )
+    # Increment total_misses counter
+    await backend.execute_write(
+        """MERGE agent_counters AS tgt
+        USING (SELECT ? AS agent_name) AS src ON tgt.agent_name = src.agent_name
+        WHEN MATCHED THEN UPDATE SET total_misses = ISNULL(tgt.total_misses, 0) + 1
+        WHEN NOT MATCHED THEN INSERT (agent_name, total_misses) VALUES (?, 1);""",
+        (agent_name, agent_name),
+    )
+    rows = await backend.execute(
+        "SELECT TOP 1 id FROM agent_misses WHERE agent_name = ? ORDER BY id DESC",
+        (agent_name,),
+    )
+    return rows[0]["id"] if rows else None
+
+
+async def get_agent_misses(
+    agent_name: str | None = None,
+    resolved: bool | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return recent miss events, optionally filtered by agent and resolution."""
+    backend = await get_backend()
+    clauses: list[str] = []
+    params: list[object] = []
+    if agent_name:
+        clauses.append("agent_name = ?")
+        params.append(agent_name)
+    if resolved is not None:
+        clauses.append("resolved = ?")
+        params.append(1 if resolved else 0)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = await backend.execute(
+        f"SELECT TOP {int(limit)} * FROM agent_misses {where} ORDER BY id DESC",
+        tuple(params),
+    )
+    return [dict(r) for r in rows] if rows else []
+
+
+async def resolve_agent_miss(miss_id: int, resolution_note: str = "") -> bool:
+    """Mark a miss as resolved."""
+    backend = await get_backend()
+    await backend.execute_write(
+        "UPDATE agent_misses SET resolved = 1, resolution_note = ? WHERE id = ?",
+        (resolution_note[:4000], miss_id),
+    )
+    return True
+
+
+# ══════════════════════════════════════════════════════════════
+# AGENT FEEDBACK — manual thumbs up/down
+# ══════════════════════════════════════════════════════════════
+
+async def insert_agent_feedback(
+    agent_name: str,
+    rating: int,
+    *,
+    activity_id: int | None = None,
+    comment: str = "",
+) -> int | None:
+    """Record a thumbs-up (5) or thumbs-down (1) feedback for an agent."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """INSERT INTO agent_feedback
+           (agent_name, activity_id, rating, comment, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (agent_name, activity_id, rating, (comment or "")[:500], now),
+    )
+    rows = await backend.execute(
+        "SELECT TOP 1 id FROM agent_feedback WHERE agent_name = ? ORDER BY id DESC",
+        (agent_name,),
+    )
+    return rows[0]["id"] if rows else None
+
+
+async def get_agent_feedback_summary(agent_name: str | None = None) -> dict:
+    """Return per-agent feedback summary: {agent_name: {up: N, down: N}}."""
+    backend = await get_backend()
+    if agent_name:
+        rows = await backend.execute(
+            """SELECT agent_name,
+                  SUM(CASE WHEN rating >= 4 THEN 1 ELSE 0 END) AS thumbs_up,
+                  SUM(CASE WHEN rating <= 2 THEN 1 ELSE 0 END) AS thumbs_down
+               FROM agent_feedback WHERE agent_name = ?
+               GROUP BY agent_name""",
+            (agent_name,),
+        )
+    else:
+        rows = await backend.execute(
+            """SELECT agent_name,
+                  SUM(CASE WHEN rating >= 4 THEN 1 ELSE 0 END) AS thumbs_up,
+                  SUM(CASE WHEN rating <= 2 THEN 1 ELSE 0 END) AS thumbs_down
+               FROM agent_feedback GROUP BY agent_name""",
+            (),
+        )
+    return {
+        r["agent_name"]: {"up": r.get("thumbs_up", 0), "down": r.get("thumbs_down", 0)}
+        for r in (rows or [])
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# PROMPT IMPROVEMENT QUEUE
+# ══════════════════════════════════════════════════════════════
+
+async def insert_prompt_improvement(
+    agent_name: str,
+    miss_pattern: str,
+    miss_count: int,
+    suggested_patch: str,
+    reasoning: str,
+) -> int | None:
+    """Queue an LLM-generated prompt improvement suggestion."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """INSERT INTO prompt_improvement_queue
+           (agent_name, miss_pattern, miss_count, suggested_patch, reasoning, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (agent_name, miss_pattern[:4000], miss_count,
+         suggested_patch[:8000], reasoning[:4000], now),
+    )
+    rows = await backend.execute(
+        "SELECT TOP 1 id FROM prompt_improvement_queue WHERE agent_name = ? ORDER BY id DESC",
+        (agent_name,),
+    )
+    return rows[0]["id"] if rows else None
+
+
+async def get_prompt_improvements(
+    agent_name: str | None = None,
+    status: str | None = None,
+) -> list[dict]:
+    """Return prompt improvement queue entries."""
+    backend = await get_backend()
+    clauses: list[str] = []
+    params: list[object] = []
+    if agent_name:
+        clauses.append("agent_name = ?")
+        params.append(agent_name)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = await backend.execute(
+        f"SELECT * FROM prompt_improvement_queue {where} ORDER BY id DESC",
+        tuple(params),
+    )
+    return [dict(r) for r in rows] if rows else []
+
+
+async def update_prompt_improvement(
+    improvement_id: int,
+    status: str,
+    reviewed_by: str = "admin",
+) -> bool:
+    """Update the status of a prompt improvement (pending → approved/rejected/applied)."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """UPDATE prompt_improvement_queue
+           SET status = ?, reviewed_by = ?, reviewed_at = ?
+           WHERE id = ?""",
+        (status, reviewed_by, now, improvement_id),
+    )
+    return True
+
+
+async def update_agent_scores(
+    agent_name: str,
+    *,
+    performance_score: int,
+    reliability_score: int,
+    speed_score: int,
+    quality_score: int,
+) -> None:
+    """Persist computed performance scores for an agent."""
+    backend = await get_backend()
+    now = datetime.now(timezone.utc).isoformat()
+    await backend.execute_write(
+        """MERGE agent_counters AS tgt
+        USING (SELECT ? AS agent_name) AS src ON tgt.agent_name = src.agent_name
+        WHEN MATCHED THEN UPDATE SET
+            performance_score = ?, reliability_score = ?,
+            speed_score = ?, quality_score = ?, last_score_update = ?
+        WHEN NOT MATCHED THEN INSERT
+            (agent_name, performance_score, reliability_score,
+             speed_score, quality_score, last_score_update)
+            VALUES (?, ?, ?, ?, ?, ?);""",
+        (agent_name, performance_score, reliability_score, speed_score,
+         quality_score, now,
+         agent_name, performance_score, reliability_score, speed_score,
+         quality_score, now),
+    )
