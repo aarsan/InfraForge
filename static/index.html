@@ -1,0 +1,1482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InfraForge — Self-Service Infrastructure Platform</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <link rel="stylesheet" href="/static/styles.css?v=282">
+    <!-- Mermaid for architecture diagrams -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+    <!-- Marked for markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Highlight.js for code syntax highlighting -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/core.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/languages/json.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/languages/yaml.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/languages/bash.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/languages/powershell.min.js"></script>
+    <script>
+        hljs.registerAliases(['bicep', 'terraform', 'hcl', 'tf'], { languageName: 'bash' });
+    </script>
+</head>
+<body>
+    <!-- ── Login Screen ──────────────────────────────────── -->
+    <div id="login-screen" class="screen">
+        <div class="login-container">
+            <div class="login-logo">
+                <span class="logo-icon">⚒️</span>
+                <h1>InfraForge</h1>
+                <p class="tagline">Self-Service Infrastructure Platform</p>
+            </div>
+            <div class="login-card">
+                <p class="login-description">
+                    Provision production-ready cloud infrastructure through natural language.
+                    Sign in with your corporate account to get started.
+                </p>
+                <button id="btn-login" class="btn btn-primary btn-login" onclick="doLogin()">
+                    <svg class="ms-icon" viewBox="0 0 21 21" xmlns="http://www.w3.org/2000/svg">
+                        <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
+                        <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+                        <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
+                        <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+                    </svg>
+                    Sign in with Microsoft
+                </button>
+                <div id="login-error" class="login-error hidden"></div>
+                <a href="https://youtu.be/SQXZkymY7oo" target="_blank" rel="noopener noreferrer" class="demo-video-link">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="vertical-align:middle;margin-right:0.4rem"><path d="M10 15l5.19-3L10 9v6m11.56-7.83c.13.47.22 1.1.28 1.9.07.8.1 1.49.1 2.09L22 12c0 2.19-.16 3.8-.44 4.83-.25.9-.83 1.48-1.73 1.73-.47.13-1.33.22-2.65.28-1.3.07-2.49.1-3.59.1L12 19c-4.19 0-6.8-.16-7.83-.44-.9-.25-1.48-.83-1.73-1.73-.13-.47-.22-1.1-.28-1.9-.07-.8-.1-1.49-.1-2.09L2 12c0-2.19.16-3.8.44-4.83.25-.9.83-1.48 1.73-1.73.47-.13 1.33-.22 2.65-.28 1.3-.07 2.49-.1 3.59-.1L12 5c4.19 0 6.8.16 7.83.44.9.25 1.48.83 1.73 1.73z"/></svg>
+                    Watch Demo
+                </a>
+                <p class="login-note">
+                    Your identity is used to auto-tag infrastructure, route approvals,
+                    and track cost attribution across your organization.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Main App ──────────────────────────────────────── -->
+    <div id="app-screen" class="screen hidden">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <span class="logo-icon-sm">⚒️</span>
+                <span class="sidebar-title">InfraForge</span>
+            </div>
+
+            <!-- User Info -->
+            <div class="user-card">
+                <div class="user-avatar" id="user-avatar"></div>
+                <div class="user-info">
+                    <div class="user-name" id="user-name"></div>
+                    <div class="user-role" id="user-role"></div>
+                    <div class="user-dept" id="user-dept"></div>
+                </div>
+            </div>
+
+            <!-- Navigation -->
+            <nav class="sidebar-nav">
+                <div class="nav-section-title">Navigation</div>
+                <button class="nav-btn active" id="nav-dashboard" onclick="navigateTo('dashboard')">
+                    <span class="nav-icon">🏠</span> Dashboard
+                </button>
+                <button class="nav-btn" id="nav-services" onclick="navigateTo('services')">
+                    <span class="nav-icon">📋</span> Service Catalog
+                    <span class="nav-tech-dot nav-tech-dot-copilot" title="Powered by Copilot SDK"></span>
+                </button>
+                <button class="nav-btn" id="nav-templates" onclick="navigateTo('templates')">
+                    <span class="nav-icon">📦</span> Templates
+                    <span class="nav-tech-dot nav-tech-dot-copilot" title="Powered by Copilot SDK"></span>
+                </button>
+                <button class="nav-btn" id="nav-governance" onclick="navigateTo('governance')">
+                    <span class="nav-icon">📜</span> Governance
+                    <span class="nav-tech-dot nav-tech-dot-copilot" title="Powered by Copilot SDK"></span>
+                </button>
+                <button class="nav-btn" id="nav-activity" onclick="navigateTo('activity')">
+                    <span class="nav-icon">📡</span> Observability
+                    <span class="nav-badge" id="nav-runs-badge" style="display:none"></span>
+                    <span class="nav-tech-dot nav-tech-dot-copilot" title="Powered by Copilot SDK"></span>
+                </button>
+
+                <button class="nav-btn" id="nav-chat" onclick="navigateTo('chat')">
+                    <span class="nav-icon">💬</span> Infrastructure Designer
+                    <span class="nav-tech-dot nav-tech-dot-copilot" title="Powered by Copilot SDK"></span>
+                </button>
+                <button class="nav-btn" id="nav-admin" onclick="navigateTo('admin')">
+                    <span class="nav-icon">⚙️</span> Admin
+                </button>
+
+                <div class="nav-section-title" style="margin-top: 0.5rem">🏢 Org Intelligence</div>
+                <button class="nav-btn" onclick="navigateToChat('Search our organization\'s M365 data for prior architecture discussions and decisions')">
+                    <span class="nav-icon">🔍</span> Search Org Knowledge
+                </button>
+                <button class="nav-btn" onclick="navigateToChat('Find related design documents, runbooks, and architecture specs in SharePoint and OneDrive')">
+                    <span class="nav-icon">📄</span> Find Related Docs
+                </button>
+                <button class="nav-btn" onclick="navigateToChat('Who are the subject matter experts for cloud infrastructure in our organization?')">
+                    <span class="nav-icon">👥</span> Find Experts
+                </button>
+
+                <div class="nav-section-title" style="margin-top: 0.5rem">Documentation</div>
+                <a class="nav-btn" href="/onboarding-docs" target="_blank" style="text-decoration:none;color:inherit">
+                    <span class="nav-icon">📖</span> Onboarding Pipeline
+                </a>
+                <a class="nav-btn" href="/docs" target="_blank" style="text-decoration:none;color:inherit">
+                    <span class="nav-icon">🔌</span> API Reference
+                </a>
+            </nav>
+
+            <!-- Session Info -->
+            <div class="sidebar-footer">
+                <div class="session-badge" id="session-badge">
+                    <span class="status-dot connected"></span> Connected
+                </div>
+                <span class="app-version-badge" id="app-version-badge"></span>
+                <button class="btn btn-sm btn-secondary" onclick="doLogout()">Sign Out</button>
+            </div>
+        </aside>
+
+        <!-- ═══ Main Content Area ═══ -->
+        <main class="main-content">
+            <!-- Content Header -->
+            <div class="content-header">
+                <div class="content-header-left">
+                    <h2 id="page-title">Dashboard</h2>
+                    <span class="powered-by" id="page-subtitle">Powered by GitHub Copilot SDK</span>
+                </div>
+                <div class="content-header-right" id="page-actions">
+                    <div class="agent-pulse-indicator" id="agent-pulse" onclick="navigateTo('activity')" title="Agent Activity">
+                        <span class="agent-pulse-dot" id="agent-pulse-dot"></span>
+                        <span class="agent-pulse-label" id="agent-pulse-label">idle</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ PAGE: Dashboard ═══════════════════════════ -->
+            <div class="page page-scroll" id="page-dashboard">
+                <div class="page-inner">
+                    <!-- Stats Bar -->
+                    <div class="dashboard-stats" id="dashboard-stats">
+                        <div class="stat-card clickable" onclick="navigateTo('services')">
+                            <div class="stat-number" id="stat-approved">—</div>
+                            <div class="stat-label">Approved Services</div>
+                        </div>
+                        <div class="stat-card clickable" onclick="navigateTo('templates')">
+                            <div class="stat-number" id="stat-templates">—</div>
+                            <div class="stat-label">Catalog Templates</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number" id="stat-conditional">—</div>
+                            <div class="stat-label">Conditional</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number" id="stat-review">—</div>
+                            <div class="stat-label">Under Review</div>
+                        </div>
+                        <div class="stat-card clickable" onclick="navigateTo('activity'); setTimeout(() => switchObsTab('validations'), 100)" title="View Pipeline Runs">
+                            <div class="stat-number stat-validating" id="stat-validating">—</div>
+                            <div class="stat-label">Validating</div>
+                        </div>
+                    </div>
+
+                    <!-- System Health (compact) -->
+                    <div class="dashboard-section">
+                        <div class="dash-section-header">
+                            <h3 class="section-title">System Health</h3>
+                            <button class="btn btn-xs btn-ghost" onclick="navigateTo('activity')" title="Open full health dashboard">View Details →</button>
+                        </div>
+                        <div class="dash-health-strip" id="dash-health-strip">
+                            <div class="dash-health-item" id="dash-health-sql" onclick="navigateTo('activity')">
+                                <span class="health-dot health-dot-unknown"></span>
+                                <span class="dash-health-name">SQL Database</span>
+                                <span class="dash-health-latency" id="dash-hlat-sql">—</span>
+                            </div>
+                            <div class="dash-health-item" id="dash-health-frontend" onclick="navigateTo('activity')">
+                                <span class="health-dot health-dot-unknown"></span>
+                                <span class="dash-health-name">Frontend</span>
+                                <span class="dash-health-latency" id="dash-hlat-frontend">—</span>
+                            </div>
+                            <div class="dash-health-item" id="dash-health-api" onclick="navigateTo('activity')">
+                                <span class="health-dot health-dot-unknown"></span>
+                                <span class="dash-health-name">Backend API</span>
+                                <span class="dash-health-latency" id="dash-hlat-api">—</span>
+                            </div>
+                            <div class="dash-health-item" id="dash-health-entra" onclick="navigateTo('activity')">
+                                <span class="health-dot health-dot-unknown"></span>
+                                <span class="dash-health-name">Entra ID</span>
+                                <span class="dash-health-latency" id="dash-hlat-entra">—</span>
+                            </div>
+                            <div class="dash-health-item" id="dash-health-workiq" onclick="navigateTo('activity')">
+                                <span class="health-dot health-dot-unknown"></span>
+                                <span class="dash-health-name">Work IQ</span>
+                                <span class="dash-health-latency" id="dash-hlat-workiq">—</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Design Mode Selector -->
+                    <div class="dashboard-section">
+                        <h3 class="section-title">Design Mode</h3>
+                        <p class="section-desc">Choose how InfraForge generates your infrastructure designs.</p>
+                        <div class="design-mode-toggle">
+                            <button class="mode-card active" id="mode-approved" onclick="setDesignMode('approved')">
+                                <span class="mode-icon">🛡️</span>
+                                <span class="mode-name">Approved Only</span>
+                                <span class="mode-desc">Build only with pre-approved services. Deploy immediately with full governance compliance.</span>
+                                <span class="mode-badge badge-approved">Default · Deploy Now</span>
+                            </button>
+                            <button class="mode-card" id="mode-ideal" onclick="setDesignMode('ideal')">
+                                <span class="mode-icon">🚀</span>
+                                <span class="mode-name">Ideal Design</span>
+                                <span class="mode-desc">Best-practice architecture regardless of approval status. Non-approved services trigger guided approval requests.</span>
+                                <span class="mode-badge badge-ideal">Requires Approval</span>
+                            </button>
+                        </div>
+                        <div class="mode-info" id="mode-info">
+                            <span class="mode-info-icon">ℹ️</span>
+                            <span class="mode-info-text">Approved Only mode: All generated infrastructure uses services vetted by the platform team. Ready to deploy.</span>
+                        </div>
+                    </div>
+
+                    <!-- Approval Request Tracker -->
+                    <div class="dashboard-section" id="approval-tracker-section">
+                        <h3 class="section-title">Approval Requests</h3>
+                        <p class="section-desc">Track the status of services submitted for IT approval.</p>
+                        <div id="approval-tracker">
+                            <div class="approval-empty">
+                                <span class="approval-empty-icon">📋</span>
+                                <p>No approval requests yet. When you use <strong>Ideal Design</strong> mode, non-approved services will be submitted here for IT review.</p>
+                            </div>
+                        </div>
+                        <div class="workflow-explainer">
+                            <h4 class="workflow-title">How Service Approval Works</h4>
+                            <div class="workflow-steps">
+                                <div class="workflow-step">
+                                    <span class="workflow-step-num">1</span>
+                                    <span class="workflow-step-icon">📨</span>
+                                    <span class="workflow-step-text">Submit Request</span>
+                                </div>
+                                <div class="workflow-arrow">→</div>
+                                <div class="workflow-step">
+                                    <span class="workflow-step-num">2</span>
+                                    <span class="workflow-step-icon">🔍</span>
+                                    <span class="workflow-step-text">IT Review</span>
+                                </div>
+                                <div class="workflow-arrow">→</div>
+                                <div class="workflow-step step-branch">
+                                    <span class="workflow-step-num">3</span>
+                                    <span class="workflow-step-icon">✅</span>
+                                    <span class="workflow-step-text">Approved / ⚠️ Conditional / ❌ Denied</span>
+                                </div>
+                                <div class="workflow-arrow">→</div>
+                                <div class="workflow-step">
+                                    <span class="workflow-step-num">4</span>
+                                    <span class="workflow-step-icon">🚀</span>
+                                    <span class="workflow-step-text">Deploy</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Agent Network (compact) -->
+                    <div class="dashboard-section">
+                        <div class="dash-section-header">
+                            <h3 class="section-title">Agent Network</h3>
+                            <button class="btn btn-xs btn-ghost" onclick="navigateTo('activity')" title="Open full agent activity">View Details →</button>
+                        </div>
+                        <div class="dash-agent-strip" id="dash-agent-strip">
+                            <div class="dash-agent-stat">
+                                <span class="dash-agent-val" id="dash-agent-ct">—</span>
+                                <span class="dash-agent-lbl">Agents</span>
+                            </div>
+                            <div class="dash-agent-sep"></div>
+                            <div class="dash-agent-stat">
+                                <span class="dash-agent-val dash-agent-ok" id="dash-agent-calls">—</span>
+                                <span class="dash-agent-lbl">SDK Calls</span>
+                            </div>
+                            <div class="dash-agent-sep"></div>
+                            <div class="dash-agent-stat">
+                                <span class="dash-agent-val dash-agent-err" id="dash-agent-errors">—</span>
+                                <span class="dash-agent-lbl">Errors</span>
+                            </div>
+                            <div class="dash-agent-sep"></div>
+                            <div class="dash-agent-stat">
+                                <span class="dash-agent-val" id="dash-agent-latency">—</span>
+                                <span class="dash-agent-lbl">Avg Latency</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Recent Activity -->
+                    <div class="dashboard-section">
+                        <div class="dash-section-header">
+                            <h3 class="section-title">Recent Activity</h3>
+                            <button class="btn btn-xs btn-ghost" onclick="navigateTo('activity'); setTimeout(() => switchObsTab('validations'), 100)" title="View all pipeline runs">View All →</button>
+                        </div>
+                        <div class="dash-activity-feed" id="dash-activity-feed">
+                            <div class="dash-activity-empty">
+                                <span class="dash-activity-empty-icon">📡</span>
+                                <p>No recent activity. Deploy a template or onboard a service to see activity here.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ PAGE: Service Catalog ═════════════════════ -->
+            <div class="page page-scroll hidden" id="page-services">
+                <div class="page-inner">
+                    <!-- Azure Services Stats Panel -->
+                    <div class="service-stats-panel" id="service-stats-panel">
+                        <div class="service-stats-cards">
+                            <div class="svc-stat-card">
+                                <div class="svc-stat-icon">🌐</div>
+                                <div class="svc-stat-body">
+                                    <div class="svc-stat-number" id="svc-stat-azure">—</div>
+                                    <div class="svc-stat-label">Azure Services</div>
+                                    <div class="svc-stat-sublabel">Available in ARM</div>
+                                </div>
+                            </div>
+                            <div class="svc-stat-card">
+                                <div class="svc-stat-icon">💾</div>
+                                <div class="svc-stat-body">
+                                    <div class="svc-stat-number" id="svc-stat-cached">—</div>
+                                    <div class="svc-stat-label">Synced</div>
+                                    <div class="svc-stat-sublabel">of Azure services</div>
+                                </div>
+                            </div>
+                            <div class="svc-stat-card">
+                                <div class="svc-stat-icon">✅</div>
+                                <div class="svc-stat-body">
+                                    <div class="svc-stat-number" id="svc-stat-approved">—</div>
+                                    <div class="svc-stat-label">Approved</div>
+                                    <div class="svc-stat-sublabel">Ready to provision</div>
+                                </div>
+                            </div>
+                            <div class="svc-stat-card svc-stat-onboarding-card" style="cursor:pointer" onclick="navigateTo('activity'); setTimeout(() => switchObsTab('validations'), 100)" title="View Pipeline Runs">
+                                <div class="svc-stat-icon">🚀</div>
+                                <div class="svc-stat-body">
+                                    <div class="svc-stat-number" id="svc-stat-onboarding">0</div>
+                                    <div class="svc-stat-label">Onboarding</div>
+                                    <div class="svc-stat-sublabel">In-progress pipelines</div>
+                                </div>
+                            </div>
+                            <div class="svc-stat-card svc-stat-sync-card">
+                                <div class="svc-stat-icon" id="svc-sync-icon">🔄</div>
+                                <div class="svc-stat-body">
+                                    <div class="svc-stat-status" id="svc-sync-status">Never synced</div>
+                                    <div class="svc-stat-label">Sync Status</div>
+                                    <div class="svc-stat-sublabel" id="svc-sync-detail">Pull services from Azure</div>
+                                </div>
+                                <button class="btn btn-sm btn-sync" id="btn-sync-panel" onclick="syncAzureServices()" title="Sync from Azure">
+                                    <span class="sync-btn-icon">⟳</span> Sync
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Search -->
+                    <div class="page-toolbar">
+                        <div class="page-search">
+                            <span class="search-icon">🔍</span>
+                            <input type="text" id="service-search" placeholder="Search services by name or ID..." oninput="searchServices(this.value)" />
+                        </div>
+                    </div>
+
+                    <!-- Filters -->
+                    <div class="filter-bar">
+                        <div class="filter-group">
+                            <span class="filter-label">Category</span>
+                            <div class="catalog-filters" id="catalog-filters">
+                                <button class="filter-pill active" onclick="filterServices('all')">All</button>
+                            </div>
+                        </div>
+                        <div class="filter-group">
+                            <span class="filter-label">Status</span>
+                            <div class="catalog-filters" id="status-filters">
+                                <button class="filter-pill active" onclick="filterServicesByStatus('active')">🚀 Active Services</button>
+                                <button class="filter-pill" onclick="filterServicesByStatus('all')">All</button>
+                                <button class="filter-pill" onclick="filterServicesByStatus('approved')">✅ Approved</button>
+                                <button class="filter-pill" onclick="filterServicesByStatus('conditional')">⚠️ Conditional</button>
+                                <button class="filter-pill" onclick="filterServicesByStatus('under_review')">🔄 Under Review</button>
+                                <button class="filter-pill" onclick="filterServicesByStatus('validating')">🚀 Onboarding</button>
+                                <button class="filter-pill" onclick="filterServicesByStatus('validation_failed')">⛔ Failed</button>
+                                <button class="filter-pill" onclick="filterServicesByStatus('offboarded')">📦 Offboarded</button>
+                                <button class="filter-pill" onclick="filterServicesByStatus('not_approved')">❌ Not Approved</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Results Summary + Check for Updates -->
+                    <div class="results-summary-bar">
+                        <div class="results-summary" id="service-results-summary"></div>
+                        <div class="update-check-area" id="update-check-area">
+                            <button class="btn btn-sm btn-check-updates" id="btn-check-updates" onclick="checkForServiceUpdates()" title="Compare onboarded service API versions against Azure's latest">
+                                <span class="update-btn-icon">⬆</span> Check for Updates
+                            </button>
+                            <span class="update-count-badge hidden" id="update-count-badge"></span>
+                        </div>
+                    </div>
+
+                    <!-- Service Table -->
+                    <div class="catalog-table-wrap full-height">
+                        <table class="catalog-table" id="catalog-table">
+                            <thead>
+                                <tr>
+                                    <th>Service</th>
+                                    <th>Category</th>
+                                    <th>Version</th>
+                                    <th>Template API</th>
+                                    <th title="Latest stable Azure API version & Microsoft recommended default (★). ✓ = template matches.">Azure API</th>
+                                    <th>Status</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="catalog-tbody">
+                                <tr><td colspan="7" class="catalog-loading">Loading services...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ PAGE: Template Catalog ════════════════════ -->
+            <div class="page page-scroll hidden" id="page-templates">
+                <div class="page-inner">
+                    <!-- Search -->
+                    <div class="page-toolbar">
+                        <div class="page-search">
+                            <span class="search-icon">🔍</span>
+                            <input type="text" id="template-search" placeholder="Search templates by name, tag, or resource type..." oninput="searchTemplates(this.value)" />
+                        </div>
+                    </div>
+
+                    <!-- Type Filters -->
+                    <div class="filter-bar">
+                        <div class="filter-group">
+                            <span class="filter-label">Type</span>
+                            <div class="catalog-filters" id="template-type-filters">
+                                <button class="filter-pill active" onclick="filterTemplateType('all')">All</button>
+                                <button class="filter-pill" onclick="filterTemplateType('foundation')">🏗️ Foundation</button>
+                                <button class="filter-pill" onclick="filterTemplateType('workload')">⚙️ Workload</button>
+                                <button class="filter-pill" onclick="filterTemplateType('composite')">📦 Composite</button>
+                            </div>
+                        </div>
+                        <div class="filter-group">
+                            <span class="filter-label">Format</span>
+                            <div class="catalog-filters" id="template-filters">
+                                <button class="filter-pill active" onclick="filterTemplates('all')">All</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Results Summary -->
+                    <div class="results-summary" id="template-results-summary"></div>
+
+                    <!-- Template Cards (replaces flat table for better dependency visibility) -->
+                    <div class="template-cards-grid" id="template-cards-grid">
+                        <div class="catalog-loading">Loading templates...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ PAGE: Governance Standards ═══════════════ -->
+            <div class="page page-scroll hidden" id="page-governance">
+                <div class="page-inner">
+                    <!-- Governance Completeness Dashboard -->
+                    <div id="gov-completeness"></div>
+
+                    <!-- Governance Policies (GOV rules with toggles) -->
+                    <div id="gov-policies-section" class="gov-policies-section"></div>
+
+                    <!-- Search -->
+                    <div class="page-toolbar">
+                        <div class="page-search">
+                            <span class="search-icon">🔍</span>
+                            <input type="text" id="standards-search" placeholder="Search standards by name, category, or ID..." oninput="searchStandards(this.value)" />
+                        </div>
+                        <button class="btn btn-sm btn-primary gov-chat-toggle" onclick="toggleGovernanceChat()" title="Ask the Governance Advisor about policies">
+                            📜 Governance Advisor
+                        </button>
+                    </div>
+
+                    <!-- Severity Filters -->
+                    <div class="filter-bar">
+                        <div class="filter-group">
+                            <span class="filter-label">Severity</span>
+                            <div class="catalog-filters" id="standards-severity-filters">
+                                <button class="filter-pill active" onclick="filterStandardsBySeverity('all')">All</button>
+                                <button class="filter-pill" onclick="filterStandardsBySeverity('critical')">🔴 Critical</button>
+                                <button class="filter-pill" onclick="filterStandardsBySeverity('high')">🟠 High</button>
+                                <button class="filter-pill" onclick="filterStandardsBySeverity('medium')">🟡 Medium</button>
+                                <button class="filter-pill" onclick="filterStandardsBySeverity('low')">🟢 Low</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Results Summary + Actions -->
+                    <div class="standards-toolbar-row">
+                        <div class="results-summary" id="standards-results-summary"></div>
+                        <button class="btn btn-sm btn-ghost btn-danger std-clear-all-btn" onclick="clearAllStandards()" title="Delete all standards">🗑️ Clear All</button>
+                    </div>
+
+                    <!-- Standards List -->
+                    <div class="standards-list" id="standards-list">
+                        <div class="catalog-loading">Loading standards...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ PAGE: Pipeline Runs (unified run view) ═══ -->
+            <!-- ═══ PAGE: Observability ═══════════════════════ -->
+            <div class="page page-scroll hidden" id="page-activity">
+                <div class="page-inner">
+                    <!-- System Health Status -->
+                    <div class="health-status-bar" id="health-status-bar">
+                        <div class="health-status-header">
+                            <div class="health-status-title">
+                                <span class="health-status-icon" id="health-overall-icon">⏳</span>
+                                <span>System Health</span>
+                            </div>
+                            <button class="health-refresh-btn" onclick="loadHealthStatus()" title="Refresh all health checks">↻</button>
+                        </div>
+                        <table class="health-table" id="health-checks">
+                            <thead>
+                                <tr>
+                                    <th class="health-th-status">Status</th>
+                                    <th>Service</th>
+                                    <th class="health-th-endpoint">Endpoint</th>
+                                    <th class="health-th-location">Location</th>
+                                    <th>Detail</th>
+                                    <th class="health-th-latency">Latency</th>
+                                    <th class="health-th-checked">Last Checked</th>
+                                    <th class="health-th-next">Next Check</th>
+                                    <th class="health-th-action"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr id="health-check-sql">
+                                    <td><span class="health-dot health-dot-unknown"></span></td>
+                                    <td class="health-check-name">SQL Database</td>
+                                    <td class="health-check-endpoint" id="health-endpoint-sql">—</td>
+                                    <td class="health-check-location" id="health-location-sql">—</td>
+                                    <td class="health-check-detail" id="health-detail-sql">Checking…</td>
+                                    <td class="health-check-latency" id="health-latency-sql">—</td>
+                                    <td class="health-check-timer" id="health-checked-sql">—</td>
+                                    <td class="health-check-timer" id="health-next-sql">—</td>
+                                    <td class="health-check-action"><button class="health-row-refresh" onclick="checkServiceHealth('sql')" title="Refresh">↻</button></td>
+                                </tr>
+                                <tr id="health-check-frontend">
+                                    <td><span class="health-dot health-dot-unknown"></span></td>
+                                    <td class="health-check-name">Frontend</td>
+                                    <td class="health-check-endpoint" id="health-endpoint-frontend">—</td>
+                                    <td class="health-check-location" id="health-location-frontend">—</td>
+                                    <td class="health-check-detail" id="health-detail-frontend">Checking…</td>
+                                    <td class="health-check-latency" id="health-latency-frontend">—</td>
+                                    <td class="health-check-timer" id="health-checked-frontend">—</td>
+                                    <td class="health-check-timer" id="health-next-frontend">—</td>
+                                    <td class="health-check-action"><button class="health-row-refresh" onclick="checkServiceHealth('frontend')" title="Refresh">↻</button></td>
+                                </tr>
+                                <tr id="health-check-api">
+                                    <td><span class="health-dot health-dot-unknown"></span></td>
+                                    <td class="health-check-name">Backend API</td>
+                                    <td class="health-check-endpoint" id="health-endpoint-api">—</td>
+                                    <td class="health-check-location" id="health-location-api">—</td>
+                                    <td class="health-check-detail" id="health-detail-api">Checking…</td>
+                                    <td class="health-check-latency" id="health-latency-api">—</td>
+                                    <td class="health-check-timer" id="health-checked-api">—</td>
+                                    <td class="health-check-timer" id="health-next-api">—</td>
+                                    <td class="health-check-action"><button class="health-row-refresh" onclick="checkServiceHealth('backend_api')" title="Refresh">↻</button></td>
+                                </tr>
+                                <tr id="health-check-entra">
+                                    <td><span class="health-dot health-dot-unknown"></span></td>
+                                    <td class="health-check-name">Entra ID</td>
+                                    <td class="health-check-endpoint" id="health-endpoint-entra">—</td>
+                                    <td class="health-check-location" id="health-location-entra">—</td>
+                                    <td class="health-check-detail" id="health-detail-entra">Checking…</td>
+                                    <td class="health-check-latency" id="health-latency-entra">—</td>
+                                    <td class="health-check-timer" id="health-checked-entra">—</td>
+                                    <td class="health-check-timer" id="health-next-entra">—</td>
+                                    <td class="health-check-action"><button class="health-row-refresh" onclick="checkServiceHealth('entra_id')" title="Refresh">↻</button></td>
+                                </tr>
+                                <tr id="health-check-workiq">
+                                    <td><span class="health-dot health-dot-unknown"></span></td>
+                                    <td class="health-check-name">Work IQ</td>
+                                    <td class="health-check-endpoint" id="health-endpoint-workiq">—</td>
+                                    <td class="health-check-location" id="health-location-workiq">—</td>
+                                    <td class="health-check-detail" id="health-detail-workiq">Checking…</td>
+                                    <td class="health-check-latency" id="health-latency-workiq">—</td>
+                                    <td class="health-check-timer" id="health-checked-workiq">—</td>
+                                    <td class="health-check-timer" id="health-next-workiq">—</td>
+                                    <td class="health-check-action"><button class="health-row-refresh" onclick="checkServiceHealth('workiq')" title="Refresh">↻</button></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Tabs -->
+                    <div class="obs-tabs">
+                        <button class="obs-tab active" id="obs-tab-agents" onclick="switchObsTab('agents')">🧭 Onboarding Pipeline <span class="nav-tech-dot nav-tech-dot-copilot" title="Powered by Copilot SDK"></span></button>
+                        <button class="obs-tab" id="obs-tab-validations" onclick="switchObsTab('validations')">🔬 Service Onboarding Pipeline <span class="nav-tech-dot nav-tech-dot-copilot" title="Powered by Copilot SDK"></span></button>
+                        <button class="obs-tab" id="obs-tab-tmpl-validations" onclick="switchObsTab('tmpl-validations')">🧪 Template Validation Pipeline <span class="nav-tech-dot nav-tech-dot-copilot" title="Powered by Copilot SDK"></span></button>
+                        <button class="obs-tab" id="obs-tab-deployments" onclick="switchObsTab('deployments')">🚀 Deployments</button>
+                        <button class="obs-tab" id="obs-tab-azure-resources" onclick="switchObsTab('azure-resources')">☁️ Azure Resources</button>
+                        <button class="obs-tab" id="obs-tab-data-mgmt" onclick="switchObsTab('data-mgmt')">💾 Data Management</button>
+                    </div>
+
+                    <!-- Tab: Onboarding Pipeline -->
+                    <div class="obs-tab-content" id="obs-content-agents">
+                        <!-- Copilot SDK powered header -->
+                        <div class="analytics-tech-header" style="margin-bottom:0.75rem">
+                            <span class="tech-badge-copilot-lg">GITHUB COPILOT SDK</span>
+                            <span class="analytics-tech-subtitle">Truth-sourced from the live onboarding process definition, activity feed, and model routing table</span>
+                        </div>
+                        <!-- Compact summary strip -->
+                        <div class="ao-summary" id="ao-summary">
+                            <div class="ao-sum-item"><span class="ao-sum-val" id="ao-agent-ct">0</span><span class="ao-sum-lbl">Steps</span></div>
+                            <div class="ao-sum-sep"></div>
+                            <div class="ao-sum-item"><span class="ao-sum-val ao-val-ok" id="ao-call-ct">0</span><span class="ao-sum-lbl">Running</span></div>
+                            <div class="ao-sum-sep"></div>
+                            <div class="ao-sum-item"><span class="ao-sum-val ao-val-err" id="ao-err-ct">0</span><span class="ao-sum-lbl">Failed</span></div>
+                            <div class="ao-sum-sep"></div>
+                            <div class="ao-sum-item"><span class="ao-sum-val" id="ao-lat-avg">—</span><span class="ao-sum-lbl">Approved</span></div>
+                            <div class="ao-sum-sep"></div>
+                            <div class="ao-sum-item"><span class="ao-sum-val ao-val-score" id="ao-score-avg">0%</span><span class="ao-sum-lbl">Avg Progress</span></div>
+                            <div class="ao-sum-sep"></div>
+                            <div class="ao-sum-item"><span class="ao-sum-val ao-val-miss" id="ao-miss-ct">0</span><span class="ao-sum-lbl">Tracked Services</span></div>
+                            <div class="ao-sum-sep"></div>
+                            <div class="ao-sum-item"><span class="ao-sum-val ao-val-improve" id="ao-improve-ct">0</span><span class="ao-sum-lbl">With Events</span></div>
+                        </div>
+
+                        <!-- Onboarding pipeline view -->
+                        <div class="ao-org" id="ao-org">
+                            <div class="activity-empty">
+                                <span class="activity-empty-icon">🧭</span>
+                                <p>Loading onboarding pipeline…</p>
+                            </div>
+                        </div>
+
+                        <!-- Expanded agent detail overlay (hidden until card click) -->
+                        <div class="ao-detail-overlay hidden" id="ao-detail-overlay">
+                            <div class="ao-detail-panel" id="ao-detail-panel"></div>
+                        </div>
+                    </div>
+
+                    <!-- Tab: Azure Resources -->
+                    <div class="obs-tab-content hidden" id="obs-content-azure-resources">
+                        <div class="azure-rg-toolbar">
+                            <button class="btn btn-sm btn-primary" onclick="loadAzureResources()" id="azure-rg-refresh-btn">🔄 Refresh</button>
+                            <button class="btn btn-sm btn-danger" onclick="cleanupOrphanedRGs()" id="azure-rg-cleanup-btn" style="display:none">🧹 Cleanup Orphaned</button>
+                            <span class="azure-rg-sub" id="azure-rg-sub"></span>
+                        </div>
+                        <div class="azure-rg-summary" id="azure-rg-summary">
+                            <div class="obs-stat">
+                                <span class="obs-stat-num" id="azure-rg-managed-count">0</span>
+                                <span class="obs-stat-label">Managed</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num obs-stat-fail" id="azure-rg-validation-count">0</span>
+                                <span class="obs-stat-label">Validation (Orphaned)</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num" id="azure-rg-deployment-count">0</span>
+                                <span class="obs-stat-label">Deployments</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num" id="azure-rg-total-count">0</span>
+                                <span class="obs-stat-label">Total in Sub</span>
+                            </div>
+                        </div>
+                        <div class="azure-rg-feed" id="azure-rg-feed">
+                            <div class="activity-empty">
+                                <span class="activity-empty-icon">☁️</span>
+                                <p>Click <b>Refresh</b> to scan your Azure subscription for InfraForge-managed resource groups.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Tab: Data Management -->
+                    <div class="obs-tab-content hidden" id="obs-content-data-mgmt">
+                        <div class="data-mgmt-container">
+                            <!-- Backup Section -->
+                            <div class="data-mgmt-section">
+                                <h4 class="data-mgmt-section-title">📦 Backup</h4>
+                                <p class="data-mgmt-section-desc">Export all database tables to a JSON file. Backups include services, templates, governance data, deployments, and all configuration.</p>
+                                <div class="data-mgmt-actions">
+                                    <button class="btn btn-sm btn-primary" onclick="createBackup()" id="backup-create-btn">📦 Create Backup</button>
+                                    <button class="btn btn-sm btn-secondary" onclick="downloadBackup()" id="backup-download-btn">⬇️ Download Backup</button>
+                                    <label class="data-mgmt-checkbox"><input type="checkbox" id="backup-include-sessions"> Include sessions</label>
+                                </div>
+                                <div id="backup-status" class="data-mgmt-status"></div>
+                            </div>
+
+                            <!-- Restore Section -->
+                            <div class="data-mgmt-section">
+                                <h4 class="data-mgmt-section-title">🔄 Restore</h4>
+                                <p class="data-mgmt-section-desc">Restore the database from a backup JSON file. <strong>Replace</strong> mode clears existing data first; <strong>Merge</strong> skips conflicting rows.</p>
+                                <div class="data-mgmt-actions">
+                                    <input type="file" id="restore-file-input" accept=".json" style="display:none" onchange="handleRestoreFileSelected(event)">
+                                    <button class="btn btn-sm btn-warning" onclick="document.getElementById('restore-file-input').click()" id="restore-upload-btn">📂 Upload & Restore</button>
+                                    <select id="restore-mode" class="data-mgmt-select">
+                                        <option value="replace">Replace (clear + insert)</option>
+                                        <option value="merge">Merge (skip conflicts)</option>
+                                    </select>
+                                </div>
+                                <div id="restore-status" class="data-mgmt-status"></div>
+                            </div>
+
+                            <!-- Available Backups -->
+                            <div class="data-mgmt-section">
+                                <h4 class="data-mgmt-section-title">📋 Available Backups</h4>
+                                <p class="data-mgmt-section-desc">Backup files saved on the server.</p>
+                                <div class="data-mgmt-actions">
+                                    <button class="btn btn-sm btn-secondary" onclick="loadBackupsList()" id="backups-refresh-btn">🔄 Refresh</button>
+                                </div>
+                                <div id="backups-list" class="data-mgmt-list"></div>
+                            </div>
+
+                            <!-- SQL Schema -->
+                            <div class="data-mgmt-section">
+                                <h4 class="data-mgmt-section-title">🗂️ Database Schema</h4>
+                                <p class="data-mgmt-section-desc">DDL scripts for all InfraForge tables are available at <code>scripts/create_tables.sql</code>.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Tab: Service Onboarding Pipeline -->
+                    <div class="obs-tab-content hidden" id="obs-content-validations">
+                        <!-- Unified Summary Bar -->
+                        <div class="obs-summary" id="runs-summary">
+                            <div class="obs-stat">
+                                <span class="obs-stat-num activity-pulse" id="runs-running">0</span>
+                                <span class="obs-stat-label">Running</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num obs-stat-ok" id="runs-succeeded">0</span>
+                                <span class="obs-stat-label">Succeeded</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num obs-stat-fail" id="runs-failed">0</span>
+                                <span class="obs-stat-label">Failed</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num obs-stat-ok" id="runs-approved">0</span>
+                                <span class="obs-stat-label">Approved</span>
+                            </div>
+                        </div>
+                        <div class="activity-summary" id="runs-activity-summary">
+                            <div class="activity-stat">
+                                <span class="activity-stat-num" id="runs-validating">0</span>
+                                <span class="activity-stat-label">Awaiting</span>
+                            </div>
+                            <div class="activity-stat">
+                                <span class="activity-stat-num activity-stat-fail" id="runs-val-failed">0</span>
+                                <span class="activity-stat-label">Failed</span>
+                            </div>
+                        </div>
+                        <div class="activity-feed" id="runs-activity-feed">
+                            <div class="activity-empty">
+                                <span class="activity-empty-icon">🔬</span>
+                                <p>No service onboarding pipeline runs yet. Onboard a service to trigger the pipeline.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Tab: Template Validation Pipeline -->
+                    <div class="obs-tab-content hidden" id="obs-content-tmpl-validations">
+                        <div class="obs-summary" id="tmpl-val-summary">
+                            <div class="obs-stat">
+                                <span class="obs-stat-num activity-pulse" id="tmpl-val-running">0</span>
+                                <span class="obs-stat-label">Running</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num obs-stat-ok" id="tmpl-val-completed">0</span>
+                                <span class="obs-stat-label">Completed</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num obs-stat-fail" id="tmpl-val-failed">0</span>
+                                <span class="obs-stat-label">Failed</span>
+                            </div>
+                            <div class="obs-stat">
+                                <span class="obs-stat-num" id="tmpl-val-heals">0</span>
+                                <span class="obs-stat-label">Heal Cycles</span>
+                            </div>
+                        </div>
+                        <div class="activity-feed" id="tmpl-val-feed">
+                            <div class="activity-empty">
+                                <span class="activity-empty-icon">🧪</span>
+                                <p>No template validation pipeline runs yet. Validate a template from the Template Catalog to see runs here.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Tab: Deployments -->
+                    <div class="obs-tab-content hidden" id="obs-content-deployments">
+                        <div class="obs-summary" style="margin-bottom: 0.75rem">
+                            <div class="obs-stat">
+                                <span class="obs-stat-num obs-stat-torn" id="runs-torn-down">0</span>
+                                <span class="obs-stat-label">Torn Down</span>
+                            </div>
+                        </div>
+                        <div class="obs-deploy-feed" id="runs-deploy-feed">
+                            <div class="activity-empty">
+                                <span class="activity-empty-icon">🚀</span>
+                                <p>No deployments yet. Deploy a template from the Template Catalog.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+
+            <!-- ═══ PAGE: Admin Settings ══════════════════════ -->
+            <div class="page page-scroll hidden" id="page-admin">
+                <div class="page-inner">
+                    <!-- Governance Enforcement Mode -->
+                    <div style="background: var(--bg-secondary); border: 1px solid var(--border-default); border-radius: var(--radius-md); padding: 1.5rem; margin-bottom: 1.5rem;">
+                        <h3 style="margin: 0 0 0.25rem 0; color: var(--text-primary);">Governance Enforcement Mode</h3>
+                        <p style="margin: 0 0 1rem 0; color: var(--text-secondary); font-size: 0.85rem;">
+                            Controls whether governance policies block deployments or only log findings.
+                            In <strong>Audit Only</strong> mode, all checks still run and report findings, but nothing prevents deployment.
+                        </p>
+                        <div id="enforcement-mode-toggle" style="display: flex; gap: 0.75rem;">
+                            <button class="btn btn-primary" id="btn-mode-enforce" onclick="setEnforcementMode('enforce')" style="flex:1; padding: 0.75rem;">
+                                Enforce
+                            </button>
+                            <button class="btn btn-secondary" id="btn-mode-audit" onclick="setEnforcementMode('audit')" style="flex:1; padding: 0.75rem;">
+                                Audit Only
+                            </button>
+                        </div>
+                        <div id="enforcement-mode-status" style="margin-top: 0.75rem; padding: 0.75rem; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); font-size: 0.85rem; color: var(--text-secondary);"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ═══ PAGE: Chat / Infrastructure Designer ═════ -->
+            <div class="page page-chat hidden" id="page-chat">
+                <!-- Messages -->
+                <div class="messages-container" id="messages">
+                    <!-- Chat Welcome -->
+                    <div class="chat-welcome" id="chat-welcome">
+                        <div class="chat-welcome-icon">⚒️</div>
+                        <h3>Infrastructure Designer <span class="tech-badge-copilot-lg">COPILOT SDK</span> <span class="tech-badge-workiq-lg">WORK IQ</span></h3>
+                        <p>Describe what you need in plain English — I'll check governance, search templates, generate IaC, and produce architecture diagrams.</p>
+                        <p class="chat-welcome-tech">Powered by <strong>GitHub Copilot SDK</strong> — multi-model AI with intelligent routing, streaming responses, and agentic tool orchestration.</p>
+                        <p class="chat-welcome-workiq-note">🏢 Connected to <strong>Microsoft Work IQ</strong> — searches your org's M365 data for architecture discussions, related docs, and subject matter experts.</p>
+                        <div class="chat-suggestions">
+                            <button class="chat-suggestion" onclick="sendQuickAction('I need a production web app with SQL database, Key Vault, and monitoring')">🏗️ Design a web app</button>
+                            <button class="chat-suggestion" onclick="sendQuickAction('Generate a CI/CD pipeline with approval gates for my infrastructure')">🔄 Create a pipeline</button>
+                            <button class="chat-suggestion" onclick="sendQuickAction('Check if App Service, SQL Database, and Key Vault are approved')">🔍 Check service approval</button>
+                            <div class="chat-suggestions-divider"></div>
+                            <button class="chat-suggestion chat-suggestion-workiq" onclick="sendQuickAction('Search our org for prior architecture discussions about microservices')">🏢 Find org discussions</button>
+                            <button class="chat-suggestion chat-suggestion-workiq" onclick="sendQuickAction('Who are the subject matter experts for Kubernetes and AKS in our organization?')">👥 Find org experts</button>
+                            <button class="chat-suggestion chat-suggestion-workiq" onclick="sendQuickAction('Find related design documents and architecture specs in our SharePoint and OneDrive')">📄 Find org docs</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tool Activity Indicator -->
+                <div class="tool-activity hidden" id="tool-activity">
+                    <div class="tool-spinner"></div>
+                    <span id="tool-activity-text">Searching template catalog...</span>
+                </div>
+
+                <!-- Input Area -->
+                <div class="input-area">
+                    <div class="input-wrapper">
+                        <textarea
+                            id="user-input"
+                            placeholder="Describe the infrastructure you need..."
+                            rows="1"
+                            onkeydown="handleKeyDown(event)"
+                            oninput="autoResizeTextarea(this)"
+                        ></textarea>
+                        <button id="btn-send" class="btn btn-send" onclick="sendMessage()" title="Send">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 2L11 13"></path>
+                                <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="input-footer">
+                        <span class="input-hint">Press Enter to send · Shift+Enter for new line</span>
+                        <span class="input-hint" id="user-context-hint"></span>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- ── Service Approval Drawer (3-Gate Workflow) ────── -->
+    <div id="service-detail-drawer" class="detail-drawer hidden">
+        <div class="detail-drawer-header">
+            <h3 id="detail-service-name">Service Name</h3>
+            <div style="display:flex;gap:0.5rem;align-items:center">
+                <button class="drawer-expand-btn" id="drawer-expand-btn" onclick="toggleDrawerExpand()" title="Expand / collapse">⛶</button>
+                <button class="modal-close" onclick="closeServiceDetail()">×</button>
+            </div>
+        </div>
+        <div class="detail-drawer-body" id="detail-service-body">
+            <!-- Populated dynamically by showServiceDetail() -->
+        </div>
+    </div>
+
+    <!-- ── Pipeline Flow Overlay (full-screen Logic Apps–style) ── -->
+    <div id="pipeline-overlay" class="pipeline-overlay hidden">
+        <div class="pipeline-overlay-header">
+            <div class="pipeline-overlay-left">
+                <span class="pipeline-overlay-icon" id="pipeline-overlay-icon">🚀</span>
+                <span class="pipeline-overlay-title" id="pipeline-overlay-title">Pipeline</span>
+            </div>
+            <div class="pipeline-overlay-meta" id="pipeline-overlay-meta"></div>
+            <div class="pipeline-overlay-right">
+                <button class="pipeline-overlay-stop hidden" id="pipeline-stop-btn" onclick="stopPipeline()" title="Stop the running pipeline">⏹ Stop</button>
+                <button class="pipeline-overlay-toggle" id="pipeline-toggle-all" onclick="toggleAllPipelineCards()" title="Expand or collapse all steps">Collapse All</button>
+                <button class="log-toggle-reasoning pipeline-overlay-reasoning" id="pipeline-reasoning-btn" onclick="toggleReasoningVisibility()" title="Show/hide AI reasoning">🧠 AI Thinking</button>
+                <button class="pipeline-overlay-close" onclick="closePipelineOverlay()">×</button>
+            </div>
+        </div>
+        <div class="pipeline-overlay-canvas" id="pipeline-canvas">
+            <!-- Flow cards render here via JS -->
+        </div>
+    </div>
+
+    <!-- ── Template Detail Panel (full-page overlay) ───────── -->
+    <div id="template-detail-drawer" class="detail-panel-overlay hidden" onclick="if(event.target===this) closeTemplateDetail()">
+        <div class="detail-panel" onclick="event.stopPropagation()">
+            <div class="detail-panel-header">
+                <button class="detail-back-btn" onclick="closeTemplateDetail()">← Back to Catalog</button>
+                <h3 id="detail-template-name">Template Name</h3>
+            </div>
+            <div class="detail-panel-body" id="detail-template-body"></div>
+        </div>
+    </div>
+
+    <!-- ── Clone Template Modal ──────────────────────────────── -->
+    <div id="modal-clone-template" class="modal-overlay hidden" onclick="closeModalOnOverlay(event, 'modal-clone-template')">
+        <div class="modal-dialog" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>📋 Clone Template</h3>
+                <button class="modal-close" onclick="closeModal('modal-clone-template')">×</button>
+            </div>
+            <form id="form-clone-template" onsubmit="submitCloneTemplate(event)">
+                <input type="hidden" name="source_id" id="clone-source-id" />
+                <div class="modal-body">
+                    <p class="form-hint">Create an independent copy of this template under a new ID. The clone starts as a draft.</p>
+                    <div class="form-group">
+                        <label for="clone-new-id">New Template ID <span class="required">*</span></label>
+                        <input type="text" id="clone-new-id" name="new_id" required
+                               placeholder="e.g. bicep-container-app-v2"
+                               pattern="[a-z0-9][a-z0-9\-]*[a-z0-9]"
+                               title="Lowercase alphanumeric with hyphens, must start and end with a letter or digit" />
+                    </div>
+                    <div class="form-group">
+                        <label for="clone-new-name">Display Name</label>
+                        <input type="text" id="clone-new-name" name="new_name"
+                               placeholder="Leave blank to use 'Original Name (Copy)'" />
+                    </div>
+                    <div id="clone-error" class="form-error" style="display:none;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('modal-clone-template')">Cancel</button>
+                    <button type="submit" class="btn btn-accent" id="btn-clone-submit">📋 Clone</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ── Governance Chat Drawer ────────────────────────────── -->
+    <div id="gov-chat-drawer" class="gov-chat-drawer hidden">
+        <div class="gov-chat-header">
+            <div class="gov-chat-title">
+                <span class="gov-chat-icon">📜</span>
+                <div>
+                    <h4>Governance Advisor</h4>
+                    <span class="gov-chat-subtitle">Ask about policies, standards, or request modifications</span>
+                </div>
+            </div>
+            <div class="gov-chat-header-actions">
+                <button class="btn btn-sm btn-ghost" onclick="clearGovernanceChat()" title="New conversation">🗒️</button>
+                <button class="modal-close" onclick="toggleGovernanceChat()">×</button>
+            </div>
+        </div>
+        <div class="gov-chat-messages" id="gov-chat-messages">
+            <div class="gov-chat-welcome" id="gov-chat-welcome">
+                <div class="gov-chat-welcome-icon">📜</div>
+                <h4>Governance Advisor</h4>
+                <p>I can help you understand policies, find standards, and request policy modifications.</p>
+                <div class="gov-chat-suggestions">
+                    <button class="gov-chat-suggestion" onclick="sendGovQuickAction('What governance policies do we have?')">📋 List all policies</button>
+                    <button class="gov-chat-suggestion" onclick="sendGovQuickAction('Do we have any rules about public IP addresses?')">🌐 Public IP rules</button>
+                    <button class="gov-chat-suggestion" onclick="sendGovQuickAction('What security standards cover encryption?')">🔐 Encryption standards</button>
+                    <button class="gov-chat-suggestion" onclick="sendGovQuickAction('What compliance frameworks are configured?')">📋 Compliance frameworks</button>
+                </div>
+            </div>
+        </div>
+        <div class="gov-chat-tool-activity hidden" id="gov-chat-tool-activity">
+            <div class="tool-spinner"></div>
+            <span id="gov-chat-tool-text">Querying policies...</span>
+        </div>
+        <div class="gov-chat-input-area">
+            <div class="gov-chat-input-wrapper">
+                <textarea
+                    id="gov-chat-input"
+                    placeholder="Ask about policies, standards, or request a modification..."
+                    rows="1"
+                    onkeydown="handleGovChatKeyDown(event)"
+                    oninput="autoResizeTextarea(this)"
+                ></textarea>
+                <button id="gov-chat-send" class="btn btn-send" onclick="sendGovMessage()" title="Send">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 2L11 13"></path>
+                        <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Concierge / CISO Chat Drawer ──────────────────────── -->
+    <div id="concierge-drawer" class="concierge-drawer hidden">
+        <div class="concierge-header">
+            <div class="concierge-title">
+                <span class="concierge-icon">🛡️</span>
+                <div>
+                    <h4>InfraForge Concierge</h4>
+                    <span class="concierge-subtitle">Ask anything · Policy concerns · CISO authority</span>
+                </div>
+            </div>
+            <div class="concierge-header-actions">
+                <button class="btn btn-sm btn-ghost" onclick="clearConciergeChat()" title="New conversation">🗒️</button>
+                <button class="modal-close" onclick="toggleConcierge()">×</button>
+            </div>
+        </div>
+        <div class="concierge-messages" id="concierge-messages">
+            <div class="concierge-welcome" id="concierge-welcome">
+                <div class="concierge-welcome-icon">🛡️</div>
+                <h4>How can I help?</h4>
+                <p>I'm your InfraForge concierge with CISO authority. Ask about policies, raise concerns, or get help with anything on the platform.</p>
+                <div class="concierge-suggestions">
+                    <button class="concierge-suggestion" onclick="sendConciergeQuickAction('I want to add an Azure Firewall but I\'m getting a policy error. Can you help?')">🔥 Policy blocking my Firewall</button>
+                    <button class="concierge-suggestion" onclick="sendConciergeQuickAction('I think our public IP policy is too restrictive and blocking productivity. Can you review it?')">⚖️ Policy is too restrictive</button>
+                    <button class="concierge-suggestion" onclick="sendConciergeQuickAction('What governance policies are currently active?')">📋 Show active policies</button>
+                    <button class="concierge-suggestion" onclick="sendConciergeQuickAction('Are there any active policy exceptions right now?')">🔓 Check policy exceptions</button>
+                </div>
+            </div>
+        </div>
+        <div class="concierge-tool-activity hidden" id="concierge-tool-activity">
+            <div class="tool-spinner"></div>
+            <span id="concierge-tool-text">Analyzing...</span>
+        </div>
+        <div class="concierge-input-area">
+            <div class="concierge-input-wrapper">
+                <textarea
+                    id="concierge-input"
+                    placeholder="Ask anything — policies, troubleshooting, guidance..."
+                    rows="1"
+                    onkeydown="handleConciergeKeyDown(event)"
+                    oninput="autoResizeTextarea(this)"
+                ></textarea>
+                <button id="concierge-send" class="btn btn-send" onclick="sendConciergeMessage()" title="Send">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 2L11 13"></path>
+                        <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Concierge Floating Action Button ──────────────────── -->
+    <button class="concierge-fab" id="concierge-fab" onclick="toggleConcierge()" title="InfraForge Concierge — Ask anything">
+        <span class="concierge-fab-icon" id="concierge-fab-icon">🛡️</span>
+    </button>
+
+    <!-- ── Service Governance Editor Modal ─────────────────── -->
+    <div id="modal-service-onboard" class="modal-overlay hidden" onclick="closeModalOnOverlay(event, 'modal-service-onboard')">
+        <div class="modal-dialog" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>⚒️ <span id="governance-modal-title">Approve Service</span></h3>
+                <button class="modal-close" onclick="closeModal('modal-service-onboard')">×</button>
+            </div>
+            <form id="form-service-onboard" onsubmit="submitGovernanceUpdate(event)">
+                <input type="hidden" name="id" />
+                <input type="hidden" name="_action" />
+                <div class="modal-body">
+                    <!-- Service identity (read-only, pre-filled) -->
+                    <div class="governance-service-header" id="governance-svc-header">
+                        <div class="svc-name" id="governance-svc-name"></div>
+                        <div class="svc-id" id="governance-svc-id"></div>
+                        <div class="governance-svc-meta">
+                            <span class="category-badge" id="governance-svc-category"></span>
+                            <span class="status-badge" id="governance-svc-status"></span>
+                        </div>
+                    </div>
+
+                    <hr class="form-divider" />
+
+                    <div class="form-group">
+                        <label>Policies <span class="hint">(one per line — defines allowed regions, SKUs, security requirements)</span></label>
+                        <textarea name="policies" rows="5" placeholder="Must use managed identity&#10;HTTPS only&#10;TLS 1.2 minimum&#10;Allowed regions: eastus2, westus3&#10;Allowed SKUs: B1, S1, P1v3"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>Conditions <span class="hint">(one per line — requirements that must be met for approval)</span></label>
+                        <textarea name="conditions" rows="3" placeholder="Requires private endpoint in production&#10;Must be deployed via approved CI/CD pipeline&#10;Requires security review for public endpoints"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>Documentation URL</label>
+                        <input type="url" name="documentation" placeholder="https://learn.microsoft.com/..." />
+                    </div>
+                    <div class="form-group">
+                        <label>Review Notes</label>
+                        <textarea name="review_notes" rows="2" placeholder="Internal notes about this approval decision..."></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('modal-service-onboard')">Cancel</button>
+                    <button type="submit" class="btn btn-accent" id="btn-submit-service">✅ Approve Service</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ── Template Onboarding Modal ─────────────────────── -->
+    <div id="modal-template-onboard" class="modal-overlay hidden" onclick="closeModalOnOverlay(event, 'modal-template-onboard')">
+        <div class="modal-dialog modal-wide" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>📦 Create Template <span class="copilot-badge copilot-badge-lg">✦ GitHub Copilot SDK</span></h3>
+                <button class="modal-close" onclick="closeModal('modal-template-onboard')">×</button>
+            </div>
+
+            <!-- ── Tab Switcher ─────────────────────────── -->
+            <div class="compose-tabs">
+                <button class="compose-tab compose-tab-active" id="compose-tab-prompt" onclick="switchComposeTab('prompt')">
+                    💬 Describe What You Need
+                </button>
+                <button class="compose-tab" id="compose-tab-manual" onclick="switchComposeTab('manual')">
+                    🔧 Pick Services Manually
+                </button>
+            </div>
+
+            <!-- ═══ Tab 1: Prompt-Driven ═══════════════════ -->
+            <div id="compose-panel-prompt" class="compose-panel">
+                <div class="modal-body">
+                    <div class="compose-prompt-section">
+                        <label class="compose-prompt-label">What infrastructure do you need?</label>
+                        <textarea id="compose-prompt-input" class="form-control compose-prompt-textarea"
+                            rows="3"
+                            placeholder="e.g. I need a VM with a SQL database and Key Vault for secrets management…"></textarea>
+                        <div class="compose-prompt-hint">The Copilot SDK will determine the right Azure services, check policies, and compose the template for you.</div>
+                    </div>
+                    <div id="compose-prompt-policy" class="tmpl-revision-policy" style="display:none;"></div>
+                    <div id="compose-prompt-result" style="display:none;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('modal-template-onboard')">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="btn-prompt-compose" onclick="submitPromptCompose()">
+                        🚀 Create Template
+                    </button>
+                </div>
+            </div>
+
+            <!-- ═══ Tab 2: Manual Service Picker ══════════ -->
+            <div id="compose-panel-manual" class="compose-panel" style="display:none;">
+            <form id="form-template-onboard" onsubmit="submitTemplateOnboarding(event)">
+                <div class="modal-body">
+                    <!-- Step 1: Template basics -->
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Template Name <span class="required">*</span></label>
+                            <input type="text" name="name" required placeholder="e.g. Web App with SQL and Key Vault" />
+                        </div>
+                        <div class="form-group">
+                            <label>Category</label>
+                            <select name="category">
+                                <option value="blueprint">Blueprint</option>
+                                <option value="compute">Compute</option>
+                                <option value="database">Database</option>
+                                <option value="storage">Storage</option>
+                                <option value="networking">Networking</option>
+                                <option value="security">Security</option>
+                                <option value="monitoring">Monitoring</option>
+                                <option value="foundation">Foundation</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Description</label>
+                        <textarea name="description" rows="2" placeholder="What this template deploys and key features..."></textarea>
+                    </div>
+
+                    <!-- Step 2: Service picker -->
+                    <div class="compose-section">
+                        <div class="compose-section-header">
+                            <span class="compose-section-title">Select Approved Services</span>
+                            <span class="compose-section-hint">Only approved, onboarded services with validated ARM templates appear here</span>
+                        </div>
+                        <div class="compose-service-search">
+                            <input type="text" id="compose-service-search" placeholder="🔍 Filter services..." oninput="filterComposeServices()" />
+                        </div>
+                        <div class="compose-service-list" id="compose-service-list">
+                            <div class="compose-loading">Loading approved services…</div>
+                        </div>
+                    </div>
+
+                    <!-- Step 3: Selected services with params -->
+                    <div class="compose-section" id="compose-selections-section" style="display:none">
+                        <div class="compose-section-header">
+                            <span class="compose-section-title">Configure Selected Services</span>
+                            <span class="compose-section-hint">Set quantity and choose which parameters to expose in the template</span>
+                        </div>
+                        <div id="compose-selections"></div>
+                    </div>
+
+                    <!-- Step 4: Dependency Analysis Preview -->
+                    <div class="compose-section" id="compose-dep-analysis-section" style="display:none">
+                        <div class="compose-section-header">
+                            <span class="compose-section-title">📊 Dependency Analysis</span>
+                            <span class="compose-section-hint">Auto-detected template type and infrastructure requirements</span>
+                        </div>
+                        <div id="compose-dep-analysis"></div>
+                    </div>
+
+                    <!-- Step 5: Test Results (shown after compose) -->
+                    <div class="compose-section" id="compose-test-results-section" style="display:none">
+                        <div class="compose-section-header">
+                            <span class="compose-section-title">🧪 Template Test Results</span>
+                            <span class="compose-section-hint">Template must pass all tests before it becomes available in the catalog</span>
+                        </div>
+                        <div id="compose-test-results"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('modal-template-onboard')">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="btn-submit-template" disabled>
+                        Create &amp; Test Template
+                    </button>
+                </div>
+            </form>
+            </div><!-- /compose-panel-manual -->
+        </div>
+    </div>
+
+    <!-- ── Add / Edit Standard Modal ───────────────────── -->
+    <div id="modal-standard" class="modal-overlay hidden" onclick="closeModalOnOverlay(event, 'modal-standard')">
+        <div class="modal-dialog" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>📜 <span id="standard-modal-title">Add Standard</span></h3>
+                <button class="modal-close" onclick="closeModal('modal-standard')">×</button>
+            </div>
+            <form id="form-standard" onsubmit="saveStandard(event)">
+                <input type="hidden" name="id" />
+                <div class="modal-body">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Name <span class="required">*</span></label>
+                            <input type="text" name="name" required placeholder="e.g. Require TLS 1.2 Minimum" />
+                        </div>
+                        <div class="form-group">
+                            <label>Category <span class="required">*</span></label>
+                            <select name="category">
+                                <option value="security">Security</option>
+                                <option value="encryption">Encryption</option>
+                                <option value="identity">Identity</option>
+                                <option value="network">Network</option>
+                                <option value="naming">Naming Convention</option>
+                                <option value="compliance">Compliance</option>
+                                <option value="monitoring">Monitoring</option>
+                                <option value="tagging">Tagging</option>
+                                <option value="geography">Geography</option>
+                                <option value="cost">Cost</option>
+                                <option value="compute">Compute</option>
+                                <option value="data_protection">Data Protection</option>
+                                <option value="operations">Operations</option>
+                                <option value="general">General</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Description</label>
+                        <textarea name="description" rows="2" placeholder="Policy statement using must/must not language per CAF..."></textarea>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Risk ID <span class="hint">(CAF risk reference)</span></label>
+                            <input type="text" name="risk_id" placeholder="e.g. R02" />
+                        </div>
+                        <div class="form-group">
+                            <label>Enforcement Tool <span class="hint">(CAF)</span></label>
+                            <input type="text" name="enforcement_tool" placeholder="e.g. Azure Policy" />
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Purpose <span class="hint">(why this standard exists — CAF)</span></label>
+                        <input type="text" name="purpose" placeholder="e.g. Mitigate data breaches and unauthorized access" />
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Severity</label>
+                            <select name="severity">
+                                <option value="critical">🔴 Critical</option>
+                                <option value="high" selected>🟠 High</option>
+                                <option value="medium">🟡 Medium</option>
+                                <option value="low">🟢 Low</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Scope <span class="hint">(resource type glob, * = all)</span></label>
+                            <input type="text" name="scope" value="*" placeholder="e.g. Microsoft.Storage/*" />
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Rule (JSON)</label>
+                        <textarea name="rule_json" rows="5" placeholder='{"type": "property", "key": "minTlsVersion", "operator": ">=", "value": "1.2", "remediation": "Set minTlsVersion to 1.2"}'></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>Change Reason <span class="hint">(for version history)</span></label>
+                        <input type="text" name="change_reason" placeholder="Why this change is being made..." />
+                    </div>
+                    <div class="form-group form-checkbox">
+                        <label><input type="checkbox" name="enabled" checked /> Enabled</label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('modal-standard')">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="btn-save-standard">Save Standard</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ── Standard Detail Drawer ────────────────────────── -->
+    <div id="standard-detail-drawer" class="detail-drawer hidden">
+        <div class="detail-drawer-header">
+            <h3 id="detail-standard-name">Standard Name</h3>
+            <button class="modal-close" onclick="closeStandardDetail()">×</button>
+        </div>
+        <div class="detail-drawer-body" id="detail-standard-body"></div>
+    </div>
+
+    <!-- ── Category Detail Panel ─────────────────────────── -->
+    <div id="category-detail-overlay" class="modal-overlay hidden" onclick="closeModalOnOverlay(event, 'category-detail-overlay')">
+        <div class="modal-dialog modal-lg" onclick="event.stopPropagation()" style="max-width: 720px;">
+            <div class="modal-header">
+                <h3 id="category-detail-title">Category</h3>
+                <button class="modal-close" onclick="closeCategoryDetail()">×</button>
+            </div>
+            <div class="modal-body" id="category-detail-body">
+                <!-- Populated dynamically by openCategoryDetail() -->
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Import Standards Modal ────────────────────────── -->
+    <div id="modal-import-standards" class="modal-overlay hidden" onclick="closeModalOnOverlay(event, 'modal-import-standards')">
+        <div class="modal-dialog modal-lg" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>📥 Import Organization Standards <span class="copilot-badge copilot-badge-lg">✦ GitHub Copilot SDK</span></h3>
+                <button class="modal-close" onclick="closeModal('modal-import-standards')">×</button>
+            </div>
+            <div class="modal-body">
+                <p class="import-intro">
+                    Import your organization's existing governance policies, security standards, or compliance requirements.
+                    The Copilot SDK extracts actionable rules and converts them into enforceable standards automatically.
+                </p>
+
+                <!-- Source Tabs -->
+                <div class="import-source-tabs">
+                    <button class="import-tab active" id="import-tab-paste" onclick="switchImportTab('paste')">📋 Paste Text</button>
+                    <button class="import-tab" id="import-tab-file" onclick="switchImportTab('file')">📄 Upload File</button>
+                </div>
+
+                <!-- Paste Source -->
+                <div id="import-source-paste" class="import-source-content">
+                    <div class="form-group">
+                        <label>Standards Documentation <span class="required">*</span></label>
+                        <textarea id="import-standards-content" rows="12"
+                            placeholder="Paste your organization's standards documentation here...&#10;&#10;Supported formats: Policy manuals, security baselines, compliance checklists,&#10;HIPAA/SOC2/PCI-DSS requirements, naming conventions, cloud governance docs...&#10;&#10;Examples:&#10;• All storage accounts must use TLS 1.2 or higher&#10;• Resource names must follow: {env}-{app}-{resourcetype}-{region}-{instance}&#10;• Resources must be tagged with: environment, owner, costCenter, project&#10;• Only eastus and westus2 regions are approved for production&#10;• PHI data stores must encrypt at rest with customer-managed keys (HIPAA §164.312)&#10;• Public network access must be disabled for all data services&#10;• Managed identities must be used instead of service principal secrets"></textarea>
+                    </div>
+                </div>
+
+                <!-- File Upload Source -->
+                <div id="import-source-file" class="import-source-content hidden">
+                    <div class="import-upload-zone" id="import-drop-zone"
+                         ondragover="event.preventDefault(); this.classList.add('drag-over')"
+                         ondragleave="this.classList.remove('drag-over')"
+                         ondrop="handleImportFileDrop(event)">
+                        <div class="import-upload-icon">📄</div>
+                        <div class="import-upload-text">Drag & drop a file here, or click to browse</div>
+                        <div class="import-upload-hint">Supports .txt, .md, .json, .csv, .docx</div>
+                        <input type="file" id="import-file-input" accept=".txt,.md,.json,.csv,.docx,.markdown" onchange="handleImportFileSelect(event)" style="display:none" />
+                        <button class="btn btn-sm btn-secondary" onclick="document.getElementById('import-file-input').click()" style="margin-top: 0.75rem">Browse Files</button>
+                    </div>
+                    <div id="import-file-info" class="import-file-info hidden">
+                        <span class="import-file-name" id="import-file-name"></span>
+                        <button class="btn btn-xs btn-ghost" onclick="clearImportFile()">✕ Remove</button>
+                    </div>
+                </div>
+
+                <!-- Extracted Preview -->
+                <div id="import-standards-preview" class="hidden" style="margin-top: 1rem;">
+                    <div class="import-preview-header">
+                        <h4>📋 Extracted Standards (<span id="import-count">0</span>)</h4>
+                        <div class="import-preview-actions">
+                            <button class="btn btn-xs btn-ghost" onclick="selectAllImports(true)">Select All</button>
+                            <button class="btn btn-xs btn-ghost" onclick="selectAllImports(false)">Deselect All</button>
+                        </div>
+                    </div>
+                    <div id="import-standards-list"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('modal-import-standards')">Cancel</button>
+                <button type="button" class="btn btn-primary" id="btn-extract-standards" onclick="extractStandards()">
+                    🤖 Extract Standards
+                </button>
+                <button type="button" class="btn btn-primary hidden" id="btn-save-imported-standards" onclick="saveImportedStandards()">
+                    💾 Save Selected Standards
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=318"></script>
+
+    <!-- ── Template Viewer Modal ─────────────────────────── -->
+    <div id="modal-template-viewer" class="modal-overlay hidden" onclick="closeModalOnOverlay(event, 'modal-template-viewer')">
+        <div class="modal-dialog modal-template-viewer-dialog" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>📄 <span id="template-viewer-title">ARM Template</span></h3>
+                <div class="template-viewer-actions">
+                    <button class="btn btn-sm btn-secondary" onclick="copyTemplateToClipboard()" title="Copy to clipboard">📋 Copy</button>
+                    <button class="btn btn-sm btn-secondary" onclick="downloadTemplate()" title="Download as JSON">⬇ Download</button>
+                    <button class="modal-close" onclick="closeModal('modal-template-viewer')">×</button>
+                </div>
+            </div>
+            <div class="modal-body template-viewer-body">
+                <div id="template-viewer-meta" class="template-viewer-meta"></div>
+                <pre id="template-viewer-code" class="template-viewer-code"><code>Loading…</code></pre>
+                <!-- Modification prompt -->
+                <div id="template-modify-section" class="template-modify-section">
+                    <div class="template-modify-header">
+                        <span class="template-modify-label">✏️ Modify Template</span>
+                        <span class="template-modify-hint">Describe your changes in plain English — the LLM will apply them and create a new version</span>
+                    </div>
+                    <div class="template-modify-input-row">
+                        <textarea id="template-modify-prompt" class="template-modify-prompt" rows="2" placeholder="e.g. Add a second subnet called 'data-subnet' with CIDR 10.0.2.0/24…"></textarea>
+                        <button id="template-modify-btn" class="btn btn-primary template-modify-btn" onclick="submitTemplateModification()">
+                            🚀 Apply
+                        </button>
+                    </div>
+                    <div id="template-modify-progress" class="template-modify-progress hidden"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
