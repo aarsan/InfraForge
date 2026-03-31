@@ -102,6 +102,531 @@ function _wfPipeline(steps, opts = {}) {
         `</div>`;
 }
 
+// ══════════════════════════════════════════════════════════════
+// UNIVERSAL PIPELINE EVENT RENDERER
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Declarative phase → flow-card mapping.
+ *
+ * Each key is a phase name (or "|"-delimited alternatives).
+ * Values describe what to do when the phase fires:
+ *   open:   [cardKey, icon, title]     → open (or reopen) a flow card
+ *   close:  [cardKey, status, label?]  → finalize a flow card
+ *   detail: [cardKey, icon, cssClass?] → append a detail line to a card
+ *
+ * Special event types (done, error, healing, governance, etc.) are
+ * handled explicitly after the map lookup.
+ */
+const PHASE_CARD_MAP = {
+    // ── Pipeline setup ──
+    'pipeline_start':          { detail: ['connecting', '✓', 'uf-text-success'] },
+    'init_model':              { open: ['setup', '⚙️', 'Pipeline Setup'] },
+    'pipeline_overview':       { close: ['setup', 'done', 'Ready'] },
+    'init_complete':           { close: ['setup', 'done', 'Ready'] },
+    'cleanup_drafts':          { detail: ['setup', '🧹'] },
+    // ── Dependency gate ──
+    'dep_gate_check':          { open: ['depGate', '🔗', 'Dependency Validation Gate'] },
+    'dep_gate_complete':       { close: ['depGate', 'done', 'Dependencies OK'] },
+    // ── Standards ──
+    'standards_analysis':      { open: ['standards', '📋', 'Analyzing Standards'] },
+    'standards_complete':      { close: ['standards', 'done'] },
+    // ── Planning ──
+    'planning':                { open: ['planning', '🧠', 'AI Planning Architecture'] },
+    'planning_complete':       { close: ['planning', 'done'] },
+    // ── Generation ──
+    'generating':              { open: ['generating', '⚡', 'Generating ARM Template'] },
+    'generated':               { close: ['generating', 'done'] },
+    // ── Checkout (API version update) ──
+    'checkout':                { open: ['checkout', '📥', 'Checking Out Template'] },
+    'checkout_complete':       { close: ['checkout', 'done'] },
+    // ── Rewrite (API version update) ──
+    'updating':                { open: ['rewrite', '🔄', 'Rewriting Template'] },
+    'executing':               { open: ['rewrite', '⚡', 'Rewriting Template'] },
+    'execute_complete':        { close: ['rewrite', 'done'] },
+    'update_complete':         { close: ['rewrite', 'done'] },
+    'saved':                   { detail: ['rewrite', '💾', 'uf-text-success'] },
+    'version_info':            { detail: ['rewrite', '🏷️'] },
+    // ── Policy generation ──
+    'policy_generation':       { open: ['policyGen', '🛡️', 'Generating Azure Policy'] },
+    'policy_generation_complete': { close: ['policyGen', 'done'] },
+    'policy_generation_warning':  { detail: ['policyGen', '⚠️'] },
+    // ── Governance ──
+    'governance_review':       { open: ['governance', '🏛️', 'Governance Review'] },
+    'governance_skipped':      { open: ['governance', '🏛️', 'Governance Review'] },
+    // ── Static policy ──
+    'static_policy_check':     { open: ['staticPolicy', '📋', 'Static Policy Checks'] },
+    'static_policy_complete':  { close: ['staticPolicy', 'done'] },
+    // ── What-If ──
+    'what_if':                 { open: ['whatif', '🔍', 'ARM What-If Analysis'] },
+    'what_if_complete':        { close: ['whatif', 'done'] },
+    // ── Deploy ──
+    'deploying':               { open: ['deploy', '🚀', 'Deploying to Azure'] },
+    'deploy_complete':         { close: ['deploy', 'done'] },
+    // ── Resource check ──
+    'resource_check':          { open: ['resourceCheck', '🔎', 'Checking Resources'] },
+    'resource_check_complete': { close: ['resourceCheck', 'done'] },
+    // ── Policy testing ──
+    'policy_testing':          { open: ['policyTest', '🛡️', 'Runtime Policy Testing'] },
+    'policy_testing_complete': { close: ['policyTest', 'done'] },
+    // ── Infra testing ──
+    'testing_start':           { open: ['infraTest', '🧪', 'Infrastructure Tests'] },
+    'testing_complete':        { close: ['infraTest', 'done'] },
+    // ── Policy deploy ──
+    'policy_deploy':           { open: ['policyDeploy', '📜', 'Deploying Policy'] },
+    'policy_deploy_complete':  { close: ['policyDeploy', 'done'] },
+    // ── Cleanup ──
+    'cleanup':                 { open: ['cleanup', '🧹', 'Cleaning Up'] },
+    'cleanup_complete':        { close: ['cleanup', 'done'] },
+    // ── Promote ──
+    'promoting':               { open: ['publishing', '🏆', 'Publishing Version'] },
+    // ── Compliance (template validation) ──
+    'compliance_scan':         { open: ['compliance', '🛡️', 'Compliance Scan'] },
+    // ── Regen ──
+    'replanning':              { open: ['regen', '🔄', 'Re-planning Architecture'] },
+};
+
+/**
+ * Universal pipeline event handler — replaces the duplicated
+ * _handleValidationFlowEvent and _handleUpdateFlowEvent functions.
+ *
+ * Routes every NDJSON event through PHASE_CARD_MAP and per-type
+ * special-case handlers to produce flow cards in the pipeline overlay.
+ *
+ * @param {HTMLElement} logEl  — the pipeline log/canvas element
+ * @param {Object}      event  — parsed NDJSON event
+ */
+function _handlePipelineEvent(logEl, event) {
+    if (!logEl) return;
+    _flowInit(logEl);
+
+    const phase = event.phase || '';
+    const type  = event.type || '';
+    const detail = event.detail || '';
+
+    // ── Stage boundary events ───────────────────────────────
+    if (type === 'stage_start') {
+        _flowFinalizeActive(logEl, 'done');
+        // Create stage header
+        const stageEl = document.createElement('div');
+        const colorCls = event.stage_color ? ` uf-stage-${event.stage_color}` : '';
+        stageEl.className = `uf-stage-header uf-stage-active${colorCls}`;
+        stageEl.dataset.stageId = event.stage_id || '';
+        stageEl.innerHTML = `
+            <span class="uf-stage-icon">${event.stage_icon || '📦'}</span>
+            <span class="uf-stage-name">${escapeHtml(event.detail || event.stage_id || 'Stage')}</span>
+            <span class="uf-stage-badge uf-badge-active"><span class="uf-badge-dot"></span></span>
+        `;
+        stageEl.addEventListener('click', () => {
+            const body = stageEl.nextElementSibling;
+            if (body && body.classList.contains('uf-stage-body')) {
+                body.classList.toggle('uf-stage-body-collapsed');
+            }
+        });
+        logEl.appendChild(stageEl);
+        // Create stage body container for cards
+        const bodyEl = document.createElement('div');
+        bodyEl.className = 'uf-stage-body';
+        bodyEl.dataset.stageId = event.stage_id || '';
+        logEl.appendChild(bodyEl);
+        logEl.scrollTop = logEl.scrollHeight;
+        return;
+    }
+    if (type === 'stage_done' || type === 'stage_failed') {
+        // Finalize active cards and update stage header
+        _flowFinalizeActive(logEl, type === 'stage_done' ? 'done' : 'failed');
+        const headers = logEl.querySelectorAll(`.uf-stage-header[data-stage-id="${event.stage_id}"]`);
+        headers.forEach(h => {
+            h.classList.remove('uf-stage-active');
+            h.classList.add(type === 'stage_done' ? 'uf-stage-done' : 'uf-stage-failed');
+            const badge = h.querySelector('.uf-stage-badge');
+            if (badge) {
+                badge.className = `uf-stage-badge ${type === 'stage_done' ? 'uf-badge-done' : 'uf-badge-failed'}`;
+                badge.innerHTML = type === 'stage_done' ? '✓' : '✗';
+            }
+        });
+        logEl.scrollTop = logEl.scrollHeight;
+        return;
+    }
+
+    // ── Connecting card (seeded progress) ────────────────────
+    if (phase === 'pipeline_start' || (phase === 'init_model' && logEl._flow?.cards?.['connecting'])) {
+        if (logEl._flow?.cards?.['connecting'] && logEl._flow.cards['connecting'].classList.contains('uf-action-active')) {
+            _flowDetail(logEl, 'connecting', '✓', 'Connected to pipeline server', 'uf-text-success');
+            _flowFinalize(logEl, 'connecting', 'done', 'Connected');
+        }
+    }
+
+    // ── PHASE_CARD_MAP lookup ────────────────────────────────
+    const mapEntry = PHASE_CARD_MAP[phase];
+    if (mapEntry) {
+        if (mapEntry.open) {
+            const [key, icon, title] = mapEntry.open;
+            _flowCard(logEl, key, icon, title + ' ' + _copilotTag());
+            if (detail) _flowDetail(logEl, key, '▸', escapeHtml(detail));
+            // Phase-specific extras
+            if (phase === 'init_model' && event.model_routing) {
+                for (const [taskKey, info] of Object.entries(event.model_routing)) {
+                    const friendlyTask = { planning: 'Planning', code_generation: 'Code Generation', code_fixing: 'Auto-Healing', policy_gen: 'Policy Generation', analysis: 'Analysis' }[taskKey] || taskKey;
+                    _flowDetail(logEl, key, '🤖', `<strong>${escapeHtml(friendlyTask)}</strong> → ${escapeHtml(info.display)}`, 'uf-text-reasoning');
+                }
+            }
+            if (phase === 'pipeline_overview' && event.steps && event.steps.length) {
+                const stepsHtml = event.steps.map((s, i) => `<strong>${i + 1}.</strong> ${escapeHtml(s)}`).join('<br>');
+                _flowDetail(logEl, key, '📋', stepsHtml);
+            }
+            if (phase === 'deploying') {
+                if (event.resource_group) _flowDetail(logEl, 'deploy', '📦', `Resource group: <strong>${escapeHtml(event.resource_group)}</strong>`);
+                if (event.region) _flowDetail(logEl, 'deploy', '🌍', `Region: <strong>${escapeHtml(event.region)}</strong>`);
+            }
+            if (phase === 'checkout' && event.current_api_version) {
+                _flowDetail(logEl, 'checkout', 'ℹ️', `Current API: <strong>${escapeHtml(event.current_api_version)}</strong> → Target: <strong>${escapeHtml(event.target_api_version || '?')}</strong>`);
+            }
+            return;
+        }
+        if (mapEntry.close) {
+            const [key, status, label] = mapEntry.close;
+            if (detail) _flowDetail(logEl, key, '✓', escapeHtml(detail), 'uf-text-success');
+            _flowFinalize(logEl, key, status, label);
+            return;
+        }
+        if (mapEntry.detail) {
+            const [key, icon, cls] = mapEntry.detail;
+            if (detail) _flowDetail(logEl, key, icon, escapeHtml(detail), cls || '');
+            return;
+        }
+    }
+
+    // ── Special-case phases not in the map ───────────────────
+
+    // Governance sub-events
+    if (phase === 'ciso_review' || phase === 'cto_review') {
+        const rev = event.review || {};
+        const agent = phase === 'ciso_review' ? 'CISO' : 'CTO';
+        const icon = phase === 'ciso_review' ? '🛡️' : '🏗️';
+        const cls = rev.verdict === 'approved' ? 'uf-text-success' : rev.verdict === 'blocked' ? 'uf-text-error' : 'uf-text-warning';
+        _flowDetail(logEl, 'governance', icon, `<strong>${agent}:</strong> ${escapeHtml(detail)}`, cls);
+        if (rev.findings && rev.findings.length) {
+            const critCount = rev.findings.filter(f => f.severity === 'critical' || f.severity === 'high').length;
+            if (critCount > 0) _flowDetail(logEl, 'governance', '⚠️', `${critCount} critical/high finding(s)`);
+        }
+        return;
+    }
+    if (phase === 'governance_blocked') {
+        _flowDetail(logEl, 'governance', '🚫', escapeHtml(detail), 'uf-text-error');
+        if (typeof _renderGovernanceResolution === 'function') _renderGovernanceResolution(logEl, event);
+        _flowFinalize(logEl, 'governance', 'failed', 'Blocked');
+        return;
+    }
+    if (phase === 'governance_complete') {
+        const cls = event.gate_decision === 'approved' ? 'uf-text-success' : event.gate_decision === 'blocked' ? 'uf-text-error' : 'uf-text-warning';
+        if (detail) _flowDetail(logEl, 'governance', '✓', escapeHtml(detail), cls);
+        _flowFinalize(logEl, 'governance', event.gate_decision === 'blocked' ? 'failed' : 'done',
+            event.gate_decision === 'approved' ? 'Approved' : event.gate_decision === 'blocked' ? 'Blocked' : 'Conditional');
+        return;
+    }
+    if (phase === 'governance_skipped' && logEl._flow?.cards?.['governance']) {
+        if (detail) _flowDetail(logEl, 'governance', '⚠️', escapeHtml(detail), 'uf-text-warning');
+        _flowFinalize(logEl, 'governance', 'done', 'Skipped');
+        return;
+    }
+
+    // Governance resolution sub-events
+    if (phase === 'governance_heal_start' || phase === 'governance_heal_strategy' || phase === 'governance_heal_complete') {
+        if (!logEl._flow?.cards?.['gov-resolve']) _flowCard(logEl, 'gov-resolve', '🔧', 'Governance Resolution ' + _copilotTag());
+        const icon = phase === 'governance_heal_complete' ? '✅' : phase === 'governance_heal_strategy' ? '📋' : '🤖';
+        const cls = phase === 'governance_heal_complete' ? 'uf-text-success' : '';
+        _flowDetail(logEl, 'gov-resolve', icon, escapeHtml(detail), cls);
+        if (phase === 'governance_heal_complete') _flowFinalize(logEl, 'gov-resolve', 'done', 'Healed');
+        return;
+    }
+    if (phase === 'governance_exception') {
+        _flowCard(logEl, 'gov-resolve', '⚡', 'Governance Exception');
+        _flowDetail(logEl, 'gov-resolve', '⚡', escapeHtml(detail), 'uf-text-warning');
+        _flowFinalize(logEl, 'gov-resolve', 'done', 'Exception');
+        return;
+    }
+    if (phase === 'governance_heal_failed') {
+        if (!logEl._flow?.cards?.['gov-resolve']) _flowCard(logEl, 'gov-resolve', '🔧', 'Governance Resolution ' + _copilotTag());
+        _flowDetail(logEl, 'gov-resolve', '❌', escapeHtml(detail), 'uf-text-error');
+        _flowFinalize(logEl, 'gov-resolve', 'failed', 'Failed');
+        return;
+    }
+
+    // Deploy / policy failures (non-fatal — heal loop may recover)
+    if (phase === 'static_policy_failed') {
+        _flowDetail(logEl, 'staticPolicy', '⚠️', escapeHtml(_friendlyError(detail)), 'uf-text-error');
+        _flowFinalize(logEl, 'staticPolicy', 'failed');
+        if (logEl._flow) logEl._flow._lastFailedKey = 'staticPolicy';
+        return;
+    }
+    if (phase === 'what_if_failed') {
+        _flowDetail(logEl, 'whatif', '⚠️', escapeHtml(_friendlyError(detail)), 'uf-text-error');
+        if (logEl._flow) logEl._flow._lastFailedKey = 'whatif';
+        return;
+    }
+    if (phase === 'deploy_failed') {
+        _flowDetail(logEl, 'deploy', '⚠️', escapeHtml(_friendlyError(detail)), 'uf-text-error');
+        if (logEl._flow) logEl._flow._lastFailedKey = 'deploy';
+        return;
+    }
+    if (phase === 'deploy_progress' || phase === 'deploy_heartbeat') {
+        if (detail) _flowDetail(logEl, 'deploy', '▸', escapeHtml(detail));
+        return;
+    }
+
+    // Dependency sub-events
+    if (phase === 'dep_gate_scanning') {
+        if (!logEl._flow?.cards?.['depGate']) _flowCard(logEl, 'depGate', '🔗', 'Dependency Validation Gate');
+        const isValid = detail && detail.includes('fully validated');
+        _flowDetail(logEl, 'depGate', isValid ? '✅' : '⚠️', escapeHtml(detail), isValid ? 'uf-text-success' : 'uf-text-warning');
+        return;
+    }
+    if (phase === 'dep_gate_onboarding' || phase === 'co_onboarding') {
+        if (!logEl._flow?.cards?.['depGate']) _flowCard(logEl, 'depGate', '🔗', 'Dependency Validation Gate');
+        _flowDetail(logEl, 'depGate', phase === 'co_onboarding' ? '👶' : '🔧', escapeHtml(detail));
+        return;
+    }
+    if (phase === 'dep_onboard_complete') {
+        _flowDetail(logEl, 'depGate', '✅', escapeHtml(detail), 'uf-text-success');
+        return;
+    }
+    if (phase === 'dep_onboard_failed') {
+        _flowDetail(logEl, 'depGate', '❌', escapeHtml(detail), 'uf-text-error');
+        return;
+    }
+
+    // Testing sub-events
+    if (phase === 'testing_generate' || phase === 'testing_execute') {
+        if (!logEl._flow?.cards?.['infraTest']) _flowCard(logEl, 'infraTest', '🧪', 'Infrastructure Tests');
+        const icon = event.status === 'complete' ? '✓' : event.status === 'error' ? '⚠️' : '▸';
+        const cls = event.status === 'complete' ? 'uf-text-success' : event.status === 'error' ? 'uf-text-error' : '';
+        if (detail) _flowDetail(logEl, 'infraTest', icon, escapeHtml(detail), cls);
+        return;
+    }
+    if (phase === 'testing_coverage') {
+        if (!logEl._flow?.cards?.['infraTest']) _flowCard(logEl, 'infraTest', '🧪', 'Infrastructure Tests');
+        const covered = event.categories_covered || [];
+        const missing = event.categories_missing || [];
+        if (covered.length) _flowDetail(logEl, 'infraTest', '✓', `Checks: ${covered.map(c => `<span class="uf-badge-success">${escapeHtml(c)}</span>`).join(' ')}`, 'uf-text-success');
+        if (missing.length) _flowDetail(logEl, 'infraTest', '⚠️', `Not covered: ${missing.map(c => `<span class="uf-badge-warning">${escapeHtml(c)}</span>`).join(' ')}`, 'uf-text-warning');
+        return;
+    }
+    if (phase === 'test_result') {
+        const passed = event.status === 'passed';
+        if (detail) _flowDetail(logEl, 'infraTest', passed ? '✅' : '❌', escapeHtml(detail), passed ? 'uf-text-success' : 'uf-text-error');
+        return;
+    }
+    if (phase === 'testing_feedback') {
+        if (detail) _flowDetail(logEl, 'infraTest', '💡', escapeHtml(detail), 'uf-text-warning');
+        return;
+    }
+    if (phase === 'testing_analyze') {
+        if (detail) _flowDetail(logEl, 'infraTest', event.status === 'complete' ? '🔍' : '▸', escapeHtml(detail));
+        return;
+    }
+
+    // Infra retry
+    if (phase === 'infra_retry') {
+        const k = logEl._flow?.activeKey || logEl._flow?._lastFailedKey;
+        if (k && detail) _flowDetailOnCard(logEl, k, '🔄', escapeHtml(detail));
+        return;
+    }
+
+    // Regen sub-events
+    if (phase === 'regenerating') {
+        if (detail) _flowDetail(logEl, 'regen', '⚙️', escapeHtml(detail));
+        return;
+    }
+    if (type === 'regen_planned') {
+        if (detail) _flowDetail(logEl, 'regen', '✓', escapeHtml(detail), 'uf-text-success');
+        return;
+    }
+    if (type === 'regen_complete') {
+        if (detail) _flowDetail(logEl, 'regen', '✅', escapeHtml(detail), 'uf-text-success');
+        _flowFinalize(logEl, 'regen', 'done');
+        return;
+    }
+
+    // Policy sub-events
+    if (phase === 'policy_failed') {
+        if (detail) _flowDetail(logEl, 'policyTest', '❌', escapeHtml(detail), 'uf-text-error');
+        _flowFinalize(logEl, 'policyTest', 'failed');
+        return;
+    }
+    if (phase === 'fixing_policy' || phase === 'policy_fixed') {
+        const k = logEl._flow?.activeKey || 'policyTest';
+        const icon = phase === 'policy_fixed' ? '✓' : '🔧';
+        const cls = phase === 'policy_fixed' ? 'uf-text-success' : '';
+        if (detail) _flowDetail(logEl, k, icon, escapeHtml(detail), cls);
+        return;
+    }
+    if (phase === 'fixing_template' || phase === 'template_fixed') {
+        const k = logEl._flow?.activeKey || 'deploy';
+        if (detail) _flowDetail(logEl, k, phase === 'template_fixed' ? '✓' : '🔧', escapeHtml(detail), phase === 'template_fixed' ? 'uf-text-success' : '');
+        return;
+    }
+
+    // ── Type-based special events ────────────────────────────
+
+    if (type === 'healing') {
+        const healKey = logEl._flow?._lastFailedKey || logEl._flow?.activeKey || 'deploy';
+        if (phase === 'escalating') {
+            _flowDetailOnCard(logEl, healKey, '🔄', escapeHtml(detail), 'uf-text-warning');
+        } else {
+            _flowDetailOnCard(logEl, healKey, '🤖', escapeHtml(detail));
+        }
+        return;
+    }
+    if (type === 'healing_done') {
+        const healKey = logEl._flow?._lastFailedKey || logEl._flow?.activeKey || 'deploy';
+        if (detail) _flowDetailOnCard(logEl, healKey, '✓', escapeHtml(detail), 'uf-text-success');
+        return;
+    }
+    if (phase === 'healing_failed') {
+        const healKey = logEl._flow?._lastFailedKey || 'deploy';
+        if (detail) _flowDetailOnCard(logEl, healKey, '⚠️', escapeHtml(detail), 'uf-text-error');
+        return;
+    }
+
+    if (type === 'llm_reasoning') {
+        // Route reasoning into the appropriate card
+        const reasoningTargets = {
+            'planning': 'planning', 'init_model': 'setup',
+            'replanning': 'regen',
+            'analyzing_deploy_failure': null, 'analyzing_whatif_failure': null,
+            'healing': null,
+        };
+        let targetKey = reasoningTargets[phase];
+        if (targetKey === undefined) targetKey = logEl._flow?.activeKey || logEl._flow?._lastFailedKey;
+        if (targetKey === null) targetKey = logEl._flow?._lastFailedKey || logEl._flow?.activeKey;
+        if (targetKey && detail) _flowDetailOnCard(logEl, targetKey, '🧠', escapeHtml(detail), 'uf-text-reasoning');
+        return;
+    }
+
+    if (type === 'standard_check') {
+        _flowDetail(logEl, logEl._flow?.activeKey || 'standards', '📏', escapeHtml(detail));
+        return;
+    }
+    if (type === 'policy_result') {
+        const k = logEl._flow?.activeKey;
+        if (k && detail) {
+            const passed = event.compliant !== undefined ? event.compliant : event.passed;
+            const icon = passed ? '✅' : ((event.severity === 'high' || event.severity === 'critical') ? '❌' : '⚠️');
+            _flowDetail(logEl, k, icon, escapeHtml(detail), passed ? 'uf-text-success' : 'uf-text-error');
+        }
+        return;
+    }
+
+    if (type === 'agent_analysis') {
+        _flowCard(logEl, 'agent_analysis', '🧠', 'Deployment Analysis ' + _copilotTag());
+        const ac = logEl._flow?.cards?.agent_analysis;
+        const body = ac?.querySelector('.uf-action-body');
+        if (body) {
+            const downgradeWarning = event.is_downgrade
+                ? `<div class="agent-analysis-downgrade">⚠️ This is an API version <strong>downgrade</strong>.</div>` : '';
+            body.innerHTML = `<div class="uf-analysis-body">${downgradeWarning}${renderMarkdown(detail)}</div>`;
+            body.classList.add('uf-body-open');
+        }
+        _flowFinalize(logEl, 'agent_analysis', 'done', 'Analysis');
+        return;
+    }
+
+    // ── Terminal events ──────────────────────────────────────
+
+    if (type === 'done') {
+        _flowFinalizeActive(logEl, 'done');
+        _flowResult(logEl, 'success', detail || 'Pipeline completed successfully');
+        _appendPipelineSummary(logEl, 'success', event);
+        return;
+    }
+    if (type === 'aborted') {
+        _flowFinalizeActive(logEl, 'failed');
+        _flowResult(logEl, 'stopped', detail || 'Pipeline stopped by user');
+        _appendPipelineSummary(logEl, 'stopped', event);
+        return;
+    }
+    if (type === 'action_required') {
+        if (typeof _renderActionRequired === 'function') _renderActionRequired(logEl, event);
+        return;
+    }
+    if (type === 'policy_blocked') {
+        _flowFinalizeActive(logEl, 'failed');
+        _flowResult(logEl, 'blocked', 'Policy review needed');
+        return;
+    }
+    if (type === 'error' && phase === 'quota_exceeded') {
+        _flowFinalizeActive(logEl, 'failed');
+        const altRegions = event.alternative_regions || [];
+        const quota = event.quota || {};
+        let regionHtml = '';
+        if (altRegions.length > 0) {
+            const svcId = event.service_id || '';
+            const btns = altRegions.map(r =>
+                `<button class="btn btn-sm btn-accent" style="margin:0.2rem" onclick="retryWithRegion('${escapeHtml(svcId)}', '${escapeHtml(r)}')">${escapeHtml(r)}</button>`
+            ).join('');
+            regionHtml = `<div class="uf-quota-alternatives" style="margin-top:0.75rem">${btns}</div>`;
+        }
+        _flowResult(logEl, 'failed',
+            `VM quota exceeded in ${escapeHtml(quota.region || 'this region')} ` +
+            `(${quota.used || '?'}/${quota.limit || '?'} cores). ${regionHtml}`);
+        return;
+    }
+    if (type === 'error') {
+        if (phase === 'governance_blocked' && logEl._flow?.cards?.['governance']) return;
+        _flowFinalizeActive(logEl, 'failed');
+        _flowResult(logEl, 'failed', detail || 'Pipeline encountered an error');
+        _appendPipelineSummary(logEl, 'failed', event);
+        return;
+    }
+
+    // ── Catch-all: append detail to active card ──────────────
+    if (detail) {
+        const activeKey = logEl._flow?.activeKey;
+        if (activeKey) _flowDetail(logEl, activeKey, '▸', escapeHtml(detail));
+    }
+}
+
+/**
+ * Render a static pipeline blueprint from a definition preview object.
+ *
+ * @param {Object} preview  — from /api/pipelines/definitions/{id}/preview
+ * @returns {string} HTML string
+ */
+function _renderPipelineBlueprint(preview) {
+    if (!preview || !preview.stages) return '';
+
+    const stagesHtml = preview.stages.map(stage => {
+        const stepsHtml = stage.steps.map(step => {
+            const healBadge = step.healable ? '<span class="blueprint-step-heal">🔧 healable</span>' : '';
+            return `<div class="blueprint-step">
+                <span class="blueprint-step-icon">${step.icon || '▸'}</span>
+                <span class="blueprint-step-name">${escapeHtml(step.name)}</span>
+                ${healBadge}
+            </div>`;
+        }).join('');
+
+        return `<div class="blueprint-stage blueprint-stage-${stage.color || 'blue'}">
+            <div class="blueprint-stage-header">
+                <span>${stage.icon || '📦'}</span>
+                <span>${escapeHtml(stage.name)}</span>
+                <span style="opacity:0.5; font-size:0.7rem;">(${stage.step_count} step${stage.step_count !== 1 ? 's' : ''})</span>
+            </div>
+            ${stepsHtml}
+        </div>`;
+    }).join('');
+
+    return `<div class="pipeline-blueprint">
+        <div class="blueprint-header">
+            <span class="blueprint-icon">${preview.icon || '🚀'}</span>
+            <span class="blueprint-title">${escapeHtml(preview.name)}</span>
+            <span class="blueprint-version">v${escapeHtml(preview.version || '1.0.0')}</span>
+        </div>
+        ${preview.description ? `<div class="blueprint-desc">${escapeHtml(preview.description)}</div>` : ''}
+        ${stagesHtml}
+    </div>`;
+}
+
 // ── State ───────────────────────────────────────────────────
 let sessionToken = null;
 let currentUser = null;
@@ -5814,8 +6339,9 @@ function _handleUpdateEvent(event) {
     }
 
     // Dispatch flow cards to all active targets (overlay + drawer)
+    // Uses the universal pipeline event handler for all pipeline types.
     for (const logEl of _getFlowTargets()) {
-        _handleUpdateFlowEvent(logEl, event, card);
+        _handlePipelineEvent(logEl, event);
     }
 
     const phase = event.phase || '';
@@ -6322,8 +6848,9 @@ function _handleValidationEvent(event) {
     }
 
     // Dispatch flow cards to all active targets (overlay + drawer)
+    // Uses the universal pipeline event handler for all pipeline types.
     for (const logEl of _getFlowTargets()) {
-        _handleValidationFlowEvent(logEl, event, card);
+        _handlePipelineEvent(logEl, event);
     }
 
     const phase = event.phase || '';

@@ -114,6 +114,36 @@ def emit(
     return json.dumps(d) + "\n"
 
 
+def emit_stage(
+    event_type: str,
+    stage_id: str,
+    stage_name: str,
+    stage_icon: str = "📦",
+    *,
+    progress: float = 0.0,
+    color: str = "blue",
+    step_count: int = 0,
+    **extra: Any,
+) -> str:
+    """Create a stage-boundary NDJSON event.
+
+    Used by ``execute_definition()`` to mark stage transitions so the
+    frontend can render collapsible stage section headers.
+
+    ``event_type`` is one of ``stage_start``, ``stage_done``,
+    ``stage_failed``.
+    """
+    return emit(
+        event_type, "stage_boundary", stage_name,
+        progress=progress,
+        stage_id=stage_id,
+        stage_icon=stage_icon,
+        stage_color=color,
+        step_count=step_count,
+        **extra,
+    )
+
+
 # ══════════════════════════════════════════════════════════════
 # EXCEPTIONS
 # ══════════════════════════════════════════════════════════════
@@ -1155,6 +1185,143 @@ class PipelineRunner:
                 f"[Pipeline:{ctx.process_id}] Cancelled"
             )
             # Cannot yield from inside GeneratorExit handler
+
+        finally:
+            _active_pipelines.pop(ctx.run_id, None)
+            for fn in self._finalizers:
+                try:
+                    await fn(ctx)
+                except Exception as e:
+                    logger.debug(f"Finalizer error: {e}")
+
+    # ── Stage-aware execution from a PipelineDefinition ──────
+
+    async def execute_definition(
+        self,
+        ctx: "PipelineContext",
+        definition: "PipelineDefinition",
+    ) -> AsyncGenerator[str, None]:
+        """Execute a pipeline from a ``PipelineDefinition`` schema.
+
+        This is the stage-aware counterpart of ``execute()``.  Instead of
+        loading steps from the DB, it walks the stages and steps defined
+        in the ``PipelineDefinition`` object and emits ``stage_start`` /
+        ``stage_done`` / ``stage_failed`` events at stage boundaries so
+        the frontend can render collapsible stage sections.
+
+        Step routing (handler lookup, on_success / on_failure) works
+        identically to ``execute()`` — registered handlers are matched
+        by the step's ``action`` field.
+
+        Parameters
+        ----------
+        definition : PipelineDefinition
+            The pipeline definition to execute.
+        """
+        from src.pipeline_schema import PipelineDefinition  # noqa: F811
+
+        ctx.process_id = ctx.process_id or definition.id
+        ctx.total_steps = definition.total_steps()
+
+        _active_pipelines[ctx.run_id] = ctx
+
+        total = definition.total_steps()
+        step_counter = 0
+
+        try:
+            for stage in definition.stages:
+                # ── Stage start ──
+                yield emit_stage(
+                    "stage_start", stage.id, stage.name, stage.icon,
+                    progress=step_counter / max(total, 1),
+                    color=stage.color,
+                    step_count=len(stage.steps),
+                )
+
+                stage_failed = False
+
+                for step in stage.steps:
+                    if ctx.aborted:
+                        yield emit(
+                            "aborted", step.action,
+                            "Pipeline aborted by user",
+                            progress=step_counter / max(total, 1),
+                        )
+                        return
+
+                    handler = self._handlers.get(step.action)
+                    if handler is None:
+                        logger.warning(
+                            f"[Pipeline:{ctx.process_id}] No handler for "
+                            f"action '{step.action}' — skipping"
+                        )
+                        step_counter += 1
+                        continue
+
+                    step_def = StepDef(
+                        order=step_counter,
+                        name=step.name,
+                        description=step.description,
+                        action=step.action,
+                        config=step.config,
+                        on_success=step.on_success,
+                        on_failure=step.on_failure,
+                    )
+
+                    try:
+                        async for line in handler(ctx, step_def):
+                            yield line
+                        ctx.steps_completed.append(step.action)
+                    except StepFailure as exc:
+                        logger.error(
+                            f"[Pipeline:{ctx.process_id}] Step "
+                            f"'{step.action}' failed: {exc.error}"
+                        )
+                        yield emit(
+                            exc.event_type, step.action,
+                            exc.error,
+                            progress=step_counter / max(total, 1),
+                        )
+                        stage_failed = True
+                        if step.on_failure == "abort":
+                            break
+                    except Exception as exc:
+                        logger.exception(
+                            f"[Pipeline:{ctx.process_id}] Unexpected "
+                            f"error in step '{step.action}'"
+                        )
+                        yield emit(
+                            "error", step.action, str(exc),
+                            progress=step_counter / max(total, 1),
+                        )
+                        stage_failed = True
+                        break
+
+                    step_counter += 1
+
+                # ── Stage end ──
+                yield emit_stage(
+                    "stage_failed" if stage_failed else "stage_done",
+                    stage.id, stage.name, stage.icon,
+                    progress=step_counter / max(total, 1),
+                    color=stage.color,
+                )
+
+                if stage_failed:
+                    return
+
+            # All stages completed
+            yield emit(
+                "done", "pipeline_complete",
+                f"Pipeline '{ctx.process_id}' completed successfully "
+                f"— {len(ctx.steps_completed)} step(s) executed",
+                progress=1.0,
+            )
+
+        except (GeneratorExit, asyncio.CancelledError):
+            logger.warning(
+                f"[Pipeline:{ctx.process_id}] Cancelled"
+            )
 
         finally:
             _active_pipelines.pop(ctx.run_id, None)

@@ -44,6 +44,11 @@ from src.tools.workiq_tools import (
     find_related_documents,
     find_subject_matter_experts,
 )
+from src.tools.pipeline_definer import (
+    define_pipeline,
+    get_pipeline_definition_tool,
+    list_pipeline_definitions_tool,
+)
 
 
 def get_all_tools() -> list:
@@ -96,6 +101,10 @@ def get_all_tools() -> list:
         teardown_deployment,
         # Platform analytics
         get_platform_overview,
+        # Pipeline management
+        define_pipeline,
+        get_pipeline_definition_tool,
+        list_pipeline_definitions_tool,
         # Microsoft Work IQ (M365 organizational intelligence)
         search_org_knowledge,
         find_related_documents,
