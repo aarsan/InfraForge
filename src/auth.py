@@ -152,6 +152,9 @@ def complete_auth(flow_id: str, auth_response: dict) -> Optional[str]:
     import logging
     log = logging.getLogger("infraforge.auth")
 
+    log.info("AUTH: completing flow — state=%s, known_flows=%d, auth_response_keys=%s",
+             flow_id[:20], len(_auth_flows), list(auth_response.keys()))
+
     flow = _auth_flows.pop(flow_id, None)
     if not flow:
         log.error("AUTH FAIL: flow not found for state=%s  (known flows: %s)",
@@ -159,11 +162,19 @@ def complete_auth(flow_id: str, auth_response: dict) -> Optional[str]:
         return None
 
     app = _get_msal_app()
-    result = app.acquire_token_by_auth_code_flow(flow, auth_response)
+    try:
+        result = app.acquire_token_by_auth_code_flow(flow, auth_response)
+    except Exception as exc:
+        log.error("AUTH FAIL: MSAL raised exception during token exchange — %s: %s",
+                  type(exc).__name__, exc)
+        return None
 
     if "access_token" not in result:
-        log.error("AUTH FAIL: token exchange failed — %s: %s",
-                  result.get("error", "unknown"), result.get("error_description", "no description"))
+        log.error("AUTH FAIL: token exchange failed — error=%s  desc=%s  correlation=%s  full_keys=%s",
+                  result.get("error", "unknown"),
+                  result.get("error_description", "no description"),
+                  result.get("correlation_id", ""),
+                  list(result.keys()))
         return None
 
     # Extract user info from the ID token claims

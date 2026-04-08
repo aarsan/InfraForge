@@ -56,7 +56,8 @@ def extract_blocked_ip(error_message: str) -> str | None:
 
 def get_firewall_retry_delay(attempt_index: int) -> float:
     """Return the bounded retry delay used between connection attempts."""
-    return max(SQL_FIREWALL_CONNECT_RETRY_DELAY_SEC, 0.0) * max(1, 2 ** attempt_index)
+    delay = max(SQL_FIREWALL_CONNECT_RETRY_DELAY_SEC, 0.0) * max(1, 2 ** attempt_index)
+    return min(delay, 30.0)  # cap at 30 seconds
 
 
 def _parse_server_from_connection_string() -> str | None:

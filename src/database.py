@@ -124,8 +124,28 @@ class AzureSQLBackend(DatabaseBackend):
             is_sql_firewall_block_error,
         )
 
+        # Transient ODBC error codes that warrant a retry
+        _TRANSIENT_SQLSTATES = {"08001", "08S01", "08S02", "HYT00", "HYT01"}
+
+        def _is_transient_error(err_msg: str, exc: pyodbc.Error) -> bool:
+            """Check if a pyodbc error is a transient connectivity issue."""
+            if hasattr(exc, "args") and exc.args:
+                sqlstate = exc.args[0] if isinstance(exc.args[0], str) else ""
+                if sqlstate in _TRANSIENT_SQLSTATES:
+                    return True
+            return any(s in err_msg for s in (
+                "forcibly closed",
+                "server too busy",
+                "prelogin failure",
+                "Connection Timeout",
+                "Login timeout",
+            ))
+
         conn = None
-        max_attempts = max(1, SQL_FIREWALL_CONNECT_RETRIES + 1)
+        # Transient errors (e.g. Azure SQL Serverless cold-start) need more
+        # retries than firewall remediation — allow at least 6 attempts to
+        # cover the ~60s resume window with exponential backoff.
+        max_attempts = max(6, SQL_FIREWALL_CONNECT_RETRIES + 1)
 
         for attempt_index in range(max_attempts):
             token_struct = self._get_token_struct()
@@ -137,28 +157,37 @@ class AzureSQLBackend(DatabaseBackend):
                 break
             except pyodbc.Error as exc:
                 err_msg = str(exc)
-                if not is_sql_firewall_block_error(err_msg):
-                    raise
-
-                blocked_ip = extract_blocked_ip(err_msg)
-                logger.warning(
-                    "SQL connection blocked by firewall (IP: %s) on attempt %d/%d — attempting auto-fix",
-                    blocked_ip or "unknown",
-                    attempt_index + 1,
-                    max_attempts,
-                )
-                remediation = await ensure_sql_firewall(blocked_ip=blocked_ip)
-                if not remediation.success:
+                if is_sql_firewall_block_error(err_msg):
+                    blocked_ip = extract_blocked_ip(err_msg)
                     logger.warning(
-                        "SQL firewall remediation did not complete: %s (%s)",
-                        remediation.reason,
-                        remediation.message or "no details",
+                        "SQL connection blocked by firewall (IP: %s) on attempt %d/%d — attempting auto-fix",
+                        blocked_ip or "unknown",
+                        attempt_index + 1,
+                        max_attempts,
                     )
-                if attempt_index >= max_attempts - 1:
-                    raise RuntimeError(
-                        f"Azure SQL firewall blocked the connection after {max_attempts} attempts. "
-                        f"Last remediation result: {remediation.reason}. {remediation.message}".strip()
-                    ) from exc
+                    remediation = await ensure_sql_firewall(blocked_ip=blocked_ip)
+                    if not remediation.success:
+                        logger.warning(
+                            "SQL firewall remediation did not complete: %s (%s)",
+                            remediation.reason,
+                            remediation.message or "no details",
+                        )
+                    if attempt_index >= max_attempts - 1:
+                        raise RuntimeError(
+                            f"Azure SQL firewall blocked the connection after {max_attempts} attempts. "
+                            f"Last remediation result: {remediation.reason}. {remediation.message}".strip()
+                        ) from exc
+                elif _is_transient_error(err_msg, exc):
+                    logger.warning(
+                        "Transient SQL connection error on attempt %d/%d: %s — retrying",
+                        attempt_index + 1,
+                        max_attempts,
+                        err_msg[:200],
+                    )
+                    if attempt_index >= max_attempts - 1:
+                        raise
+                else:
+                    raise
 
                 await asyncio.sleep(get_firewall_retry_delay(attempt_index))
 

@@ -106,7 +106,11 @@ async def auth_callback(request: Request):
     flow_id = request.query_params.get("state", "")
     auth_response = dict(request.query_params)
 
-    session_token = complete_auth(flow_id, auth_response)
+    try:
+        session_token = complete_auth(flow_id, auth_response)
+    except Exception:
+        logger.exception("Unhandled exception in auth callback")
+        raise HTTPException(status_code=401, detail="Authentication failed")
     if not session_token:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
@@ -114,12 +118,16 @@ async def auth_callback(request: Request):
     pending = get_pending_session(session_token)
     if pending:
         user_ctx = pending["user_context"]
-        await save_session(
-            session_token,
-            _user_context_to_dict(user_ctx),
-            pending.get("access_token", ""),
-            pending.get("claims"),
-        )
+        try:
+            await save_session(
+                session_token,
+                _user_context_to_dict(user_ctx),
+                pending.get("access_token", ""),
+                pending.get("claims"),
+            )
+        except Exception:
+            logger.exception("Failed to persist session to database")
+            raise HTTPException(status_code=500, detail="Session persistence failed")
 
     # Redirect to the main app with the session token
     return RedirectResponse(url=f"/?session={session_token}")
