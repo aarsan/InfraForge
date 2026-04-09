@@ -1,0 +1,95 @@
+# Full integration: multi-stage, context passing, shell, conditions, dry_run=false
+name: full-integration
+context:
+  project: "pipeline-engine"
+  version: "0.1.0"
+  run_tests: true
+  notifier_url: ""
+options:
+  timeout: 120
+stages:
+  - id: setup
+    name: Setup
+    steps:
+      - id: init
+        type: noop
+        name: Initialize
+        config:
+          message: "Starting full integration pipeline"
+          outputs:
+            initialized: true
+            build_number: "42"
+        outputs:
+          initialized: ctx.initialized
+          build_number: ctx.build_number
+        timeout: 10
+
+  - id: build
+    name: Build & Test
+    steps:
+      - id: check_python
+        type: shell
+        name: Verify Python
+        config:
+          command: "python --version"
+        outputs:
+          stdout: ctx.python_ver
+        timeout: 10
+
+      - id: run_tests
+        type: shell
+        name: Run Unit Tests
+        config:
+          command: "python -c \"print('All 40 tests passed')\""
+        outputs:
+          stdout: ctx.test_output
+        condition: "ctx.run_tests"
+        timeout: 30
+
+  - id: package
+    name: Package
+    steps:
+      - id: create_artifact
+        type: noop
+        name: Create Artifact
+        config:
+          message: "Packaging build #{ctx.build_number}"
+          outputs:
+            artifact_path: "dist/pipeline-engine-0.1.0.tar.gz"
+        inputs:
+          build_number: ctx.build_number
+        outputs:
+          artifact_path: ctx.artifact_path
+        timeout: 10
+
+  - id: notify
+    name: Notify (skipped — no URL)
+    condition: "ctx.notifier_url"
+    steps:
+      - id: send_notification
+        type: http
+        name: Send Slack Notification
+        config:
+          method: POST
+          url: "{ctx.notifier_url}"
+          body:
+            text: "Build #{ctx.build_number} complete"
+        timeout: 10
+
+  - id: report
+    name: Final Report
+    steps:
+      - id: done
+        type: noop
+        name: Pipeline Complete
+        config:
+          message: "Full integration pipeline finished successfully"
+          outputs:
+            final_status: "success"
+        inputs:
+          python_ver: ctx.python_ver
+          test_output: ctx.test_output
+          artifact_path: ctx.artifact_path
+        outputs:
+          final_status: ctx.final_status
+        timeout: 10

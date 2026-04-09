@@ -1,0 +1,64 @@
+# Multi-stage pipeline with context passing between steps
+name: multi-stage-context
+context:
+  project_name: "InfraForge"
+  environment: "staging"
+options:
+  timeout: 60
+stages:
+  - id: prepare
+    name: Preparation
+    steps:
+      - id: set_config
+        type: noop
+        name: Set Configuration
+        config:
+          message: "Setting up config for {ctx.project_name}"
+          outputs:
+            resource_group: "rg-infraforge-staging"
+            region: "eastus2"
+        outputs:
+          resource_group: ctx.resource_group
+          region: ctx.region
+        timeout: 10
+
+      - id: set_tags
+        type: noop
+        name: Set Tags
+        config:
+          message: "Setting resource tags"
+          outputs:
+            tags: '{"env": "staging", "project": "infraforge"}'
+        outputs:
+          tags: ctx.tags
+        timeout: 10
+
+  - id: generate
+    name: Resource Generation
+    steps:
+      - id: gen_template
+        type: noop
+        name: Generate ARM Template
+        config:
+          message: "Generating template for resource group"
+          outputs:
+            template: '{"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#"}'
+        inputs:
+          resource_group: ctx.resource_group
+          region: ctx.region
+        outputs:
+          template: ctx.template
+        timeout: 15
+
+  - id: finalize
+    name: Finalize
+    steps:
+      - id: summary
+        type: noop
+        name: Pipeline Summary
+        config:
+          message: "Pipeline complete — template generated"
+        inputs:
+          template: ctx.template
+          tags: ctx.tags
+        timeout: 10

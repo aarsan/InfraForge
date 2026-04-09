@@ -1,0 +1,44 @@
+# Tests healing: a step that uses a noop healer
+# Note: healing requires a step type that fails, then succeeds after healer
+# runs. Since we only have built-in types, we use noop for both. The healing
+# path won't actually trigger here (noop doesn't fail), but this validates
+# the schema and config parsing. Real healing tests use pytest fixtures.
+name: healing-config-test
+context:
+  template: '{"resources": []}'
+options:
+  timeout: 60
+stages:
+  - id: generate
+    name: Generate With Healing
+    steps:
+      - id: gen_template
+        type: noop
+        name: Generate Template (healable)
+        config:
+          message: "Generating template..."
+          outputs:
+            template: '{"$schema": "...", "resources": [{"type": "vnet"}]}'
+        outputs:
+          template: ctx.template
+        timeout: 30
+        healing:
+          enabled: true
+          max_attempts: 3
+          backoff: exponential
+          base_delay: 1.0
+          healer_type: noop
+          healer_config:
+            message: "Healing template..."
+
+  - id: validate
+    name: Validate
+    steps:
+      - id: validate_template
+        type: noop
+        name: Validate Generated Template
+        config:
+          message: "Validation passed"
+        inputs:
+          template: ctx.template
+        timeout: 10

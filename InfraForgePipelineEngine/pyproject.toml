@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipeline-engine"
+version = "0.1.0"
+description = "Standalone pipeline execution engine with plugin-based step registry"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "pyyaml>=6.0",
+    "colorama>=0.4.6",
+]
+
+[project.entry-points."pipeline_engine.steps"]
+noop = "pipeline_engine.steps.noop_step:NoopStepHandler"
+python = "pipeline_engine.steps.python_step:PythonStepHandler"
+shell = "pipeline_engine.steps.shell_step:ShellStepHandler"
+http = "pipeline_engine.steps.http_step:HttpStepHandler"
+gate = "pipeline_engine.steps.gate_step:GateStepHandler"
+llm = "pipeline_engine.steps.llm_step:LlmStepHandler"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipeline_engine"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

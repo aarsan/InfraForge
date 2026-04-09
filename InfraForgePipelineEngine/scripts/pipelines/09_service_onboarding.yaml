@@ -1,0 +1,234 @@
+# Business process: Service onboarding with human gates
+# Demonstrates: automated steps + LLM generation + human approvals
+#
+# Flow:
+#   1. Initialize context (automated)
+#   2. LLM generates architecture plan (automated, dry_run safe)
+#   3. Architecture review gate (HUMAN — pauses pipeline)
+#   4. Generate ARM template based on approved plan (automated)
+#   5. Security review gate (HUMAN — pauses pipeline)
+#   6. Deploy to test environment (automated)
+#   7. Final sign-off gate (HUMAN)
+#   8. Promote to production catalog (automated)
+
+name: service-onboarding-with-gates
+context:
+  service_id: "Microsoft.Network/virtualNetworks"
+  region: "eastus2"
+  subscription_id: "00000000-0000-0000-0000-000000000000"
+  team: "platform-engineering"
+options:
+  timeout: 604800  # 7 days — allows for human review time
+  dry_run: false
+
+stages:
+  # ── Stage 1: Automated initialization ─────────────────────────
+  - id: init
+    name: Initialize
+    steps:
+      - id: setup
+        type: noop
+        name: Initialize Pipeline Context
+        config:
+          message: "Initializing onboarding for {ctx.service_id}"
+          outputs:
+            model_routing: "gpt-4o"
+            standards_context: "Azure Well-Architected Framework, CIS Benchmarks"
+        outputs:
+          model_routing: ctx.model_routing
+          standards_context: ctx.standards_context
+        timeout: 10
+
+  # ── Stage 2: LLM generates architecture plan ──────────────────
+  - id: planning
+    name: Architecture Planning
+    steps:
+      - id: plan_architecture
+        type: noop
+        name: Generate Architecture Plan (LLM)
+        config:
+          message: "LLM generating architecture plan for {ctx.service_id}"
+          outputs:
+            architecture_plan: |
+              ## Architecture Plan for Microsoft.Network/virtualNetworks
+              - VNet with 3 subnets (web, app, data)
+              - NSGs per subnet with least-privilege rules
+              - Azure Firewall in hub VNet
+              - DDoS Protection Standard enabled
+              - Private DNS zones for internal resolution
+        outputs:
+          architecture_plan: ctx.architecture_plan
+        timeout: 120
+
+  # ── Stage 3: HUMAN architecture review ─────────────────────────
+  - id: arch_review
+    name: Architecture Review
+    steps:
+      - id: arch_gate
+        type: gate
+        name: Architecture Review
+        config:
+          gate_type: review
+          assignee: architecture-team
+          instructions: |
+            Review the generated architecture plan for the service.
+            Verify it meets organizational standards and best practices.
+            Provide your verdict and any feedback.
+          required_inputs:
+            - name: verdict
+              type: enum
+              options: [approved, rejected, needs_changes]
+              required: true
+              description: "Architecture review decision"
+            - name: feedback
+              type: text
+              required: false
+              description: "Detailed feedback or change requests"
+          sla_seconds: 86400
+          escalation_assignee: chief-architect
+        inputs:
+          architecture_plan: ctx.architecture_plan
+          service_id: ctx.service_id
+        outputs:
+          verdict: ctx.arch_verdict
+          feedback: ctx.arch_feedback
+        on_failure: abort
+
+  # ── Stage 4: Generate ARM template from approved plan ──────────
+  - id: generate
+    name: Template Generation
+    condition: "ctx.arch_verdict == approved"
+    steps:
+      - id: gen_arm
+        type: noop
+        name: Generate ARM Template (LLM)
+        config:
+          message: "Generating ARM template based on approved architecture plan"
+          outputs:
+            template: '{"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#", "resources": [{"type": "Microsoft.Network/virtualNetworks"}]}'
+        inputs:
+          architecture_plan: ctx.architecture_plan
+        outputs:
+          template: ctx.template
+        timeout: 180
+
+  # ── Stage 5: HUMAN security review ─────────────────────────────
+  - id: security_review
+    name: Security Review
+    steps:
+      - id: security_gate
+        type: gate
+        name: Security Review
+        config:
+          gate_type: approval
+          assignee: security-team
+          instructions: |
+            Review the generated ARM template for security compliance:
+            - Check NSG rules meet CIS benchmarks
+            - Verify no public IPs exposed unnecessarily
+            - Confirm encryption at rest and in transit
+            - Validate RBAC and managed identity usage
+          required_inputs:
+            - name: security_verdict
+              type: enum
+              options: [approved, rejected, conditional_approval]
+              required: true
+              description: "Security team decision"
+            - name: security_findings
+              type: json
+              required: false
+              description: "JSON list of security findings"
+            - name: risk_level
+              type: enum
+              options: [low, medium, high, critical]
+              required: true
+              description: "Overall risk assessment"
+          sla_seconds: 172800
+          escalation_assignee: ciso
+        inputs:
+          template: ctx.template
+          architecture_plan: ctx.architecture_plan
+        outputs:
+          security_verdict: ctx.security_verdict
+          security_findings: ctx.security_findings
+          risk_level: ctx.risk_level
+        on_failure: abort
+
+  # ── Stage 6: Deploy to test environment ────────────────────────
+  - id: test_deploy
+    name: Test Deployment
+    condition: "ctx.security_verdict == approved"
+    steps:
+      - id: deploy
+        type: noop
+        name: Deploy to Test Environment
+        config:
+          message: "Deploying to test resource group"
+          outputs:
+            deployment_id: "deploy-20260409-001"
+            deployment_status: "succeeded"
+        outputs:
+          deployment_id: ctx.deployment_id
+          deployment_status: ctx.deployment_status
+        timeout: 600
+
+      - id: smoke_test
+        type: shell
+        name: Run Smoke Tests
+        config:
+          command: 'python -c "print(''All infrastructure smoke tests passed'')"'
+        outputs:
+          stdout: ctx.test_results
+        timeout: 120
+
+  # ── Stage 7: HUMAN final sign-off ──────────────────────────────
+  - id: signoff
+    name: Final Sign-Off
+    steps:
+      - id: final_gate
+        type: gate
+        name: Production Sign-Off
+        config:
+          gate_type: sign_off
+          assignee: service-owner
+          instructions: |
+            All automated checks have passed. The service has been:
+            1. Architecture reviewed ✓
+            2. Security reviewed ✓
+            3. Deployed and tested in staging ✓
+
+            Please sign off to promote this service to the production catalog.
+          required_inputs:
+            - name: signoff
+              type: boolean
+              required: true
+              description: "Confirm promotion to production"
+            - name: notes
+              type: text
+              required: false
+              description: "Any final notes"
+        inputs:
+          deployment_status: ctx.deployment_status
+          test_results: ctx.test_results
+          security_verdict: ctx.security_verdict
+        outputs:
+          signoff: ctx.signoff
+          notes: ctx.signoff_notes
+
+  # ── Stage 8: Promote to catalog ────────────────────────────────
+  - id: promote
+    name: Promote to Catalog
+    condition: "ctx.signoff"
+    steps:
+      - id: catalog_publish
+        type: noop
+        name: Publish to Service Catalog
+        config:
+          message: "Publishing {ctx.service_id} v1.0.0 to production catalog"
+          outputs:
+            catalog_version: "v1.0.0"
+            catalog_status: "published"
+        outputs:
+          catalog_version: ctx.catalog_version
+          catalog_status: ctx.catalog_status
+        timeout: 30

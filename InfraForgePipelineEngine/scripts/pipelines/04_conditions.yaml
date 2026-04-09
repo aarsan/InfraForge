@@ -1,0 +1,39 @@
+# Tests conditional step and stage execution
+name: conditions-test
+context:
+  deploy_needed: true
+  skip_cleanup: false
+options:
+  timeout: 30
+stages:
+  - id: deploy
+    name: Conditional Deploy
+    steps:
+      - id: run_deploy
+        type: noop
+        name: Deploy (runs because deploy_needed is true)
+        config:
+          message: "Deploying..."
+          outputs:
+            deployed: true
+        outputs:
+          deployed: ctx.deployed
+        condition: "ctx.deploy_needed"
+        timeout: 10
+
+      - id: skip_this
+        type: noop
+        name: Skipped Step (nonexistent_flag is falsy)
+        config:
+          message: "BUG — should be skipped"
+        condition: "ctx.nonexistent_flag"
+
+  - id: cleanup
+    name: Cleanup (skipped because skip_cleanup is false)
+    condition: "ctx.skip_cleanup"
+    steps:
+      - id: do_cleanup
+        type: noop
+        name: Cleanup Resources
+        config:
+          message: "BUG — entire stage should be skipped"

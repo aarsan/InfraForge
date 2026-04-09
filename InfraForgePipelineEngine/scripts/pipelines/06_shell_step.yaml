@@ -1,0 +1,27 @@
+# Tests the shell step type — runs system commands
+name: shell-step-test
+context:
+  work_dir: "."
+options:
+  timeout: 30
+stages:
+  - id: system_info
+    name: System Info
+    steps:
+      - id: python_version
+        type: shell
+        name: Check Python Version
+        config:
+          command: "python --version"
+        outputs:
+          stdout: ctx.python_version
+        timeout: 10
+
+      - id: list_files
+        type: shell
+        name: List Current Directory
+        config:
+          command: "python -c \"import os; print(os.listdir('.'))\""
+        outputs:
+          stdout: ctx.file_list
+        timeout: 10

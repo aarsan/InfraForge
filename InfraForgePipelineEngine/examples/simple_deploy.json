@@ -1,0 +1,46 @@
+{
+  "name": "simple-deploy",
+  "context": {
+    "greeting": "Hello from the Pipeline Engine!"
+  },
+  "options": {
+    "timeout": 60,
+    "dry_run": false
+  },
+  "stages": [
+    {
+      "id": "demo",
+      "name": "Demo Stage",
+      "steps": [
+        {
+          "id": "step1",
+          "type": "noop",
+          "name": "Echo Greeting",
+          "config": {
+            "message": "Running demo pipeline",
+            "outputs": {"echo": "Pipeline engine is working!"}
+          },
+          "inputs": {
+            "greeting": "ctx.greeting"
+          },
+          "outputs": {
+            "echo": "ctx.echo_result"
+          },
+          "timeout": 10
+        },
+        {
+          "id": "step2",
+          "type": "noop",
+          "name": "Final Step",
+          "config": {
+            "message": "All done"
+          },
+          "inputs": {
+            "previous_result": "ctx.echo_result"
+          },
+          "timeout": 10
+        }
+      ]
+    }
+  ]
+}

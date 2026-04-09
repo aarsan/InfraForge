@@ -1,0 +1,103 @@
+{
+  "name": "autoiac-generate",
+  "context": {
+    "format": "arm",
+    "services": [
+      {
+        "service_type": "vnet",
+        "resource_name": "vnet-prod-01",
+        "address_space": "10.0.0.0/16",
+        "subnets": [
+          {"resource_name": "snet-web", "address_prefix": "10.0.1.0/24"},
+          {"resource_name": "snet-data", "address_prefix": "10.0.2.0/24"}
+        ]
+      },
+      {
+        "service_type": "keyvault",
+        "resource_name": "kv-prod-01"
+      },
+      {
+        "service_type": "sql",
+        "resource_name": "sql-prod-01",
+        "admin_login": "sqladmin"
+      }
+    ]
+  },
+  "options": {
+    "timeout": 60,
+    "dry_run": false
+  },
+  "stages": [
+    {
+      "id": "validate",
+      "name": "Validate Service Configs",
+      "steps": [
+        {
+          "id": "validate_services",
+          "type": "python",
+          "name": "Validate All Service Configurations",
+          "config": {
+            "module": "autoiac_steps.validation",
+            "function": "validate_services"
+          },
+          "inputs": {
+            "services": "ctx.services"
+          },
+          "outputs": {
+            "validated_services": "ctx.validated_services"
+          },
+          "timeout": 10,
+          "on_failure": "abort"
+        }
+      ]
+    },
+    {
+      "id": "generate",
+      "name": "Generate Template",
+      "steps": [
+        {
+          "id": "generate_template",
+          "type": "python",
+          "name": "Generate ARM/Bicep/Terraform Template",
+          "config": {
+            "module": "autoiac_steps.generate",
+            "function": "generate_template"
+          },
+          "inputs": {
+            "format": "ctx.format",
+            "services": "ctx.validated_services"
+          },
+          "outputs": {
+            "template": "ctx.template"
+          },
+          "timeout": 30,
+          "on_failure": "abort"
+        }
+      ]
+    },
+    {
+      "id": "validate_output",
+      "name": "Validate Generated Template",
+      "steps": [
+        {
+          "id": "validate_template",
+          "type": "python",
+          "name": "Validate Template Syntax",
+          "config": {
+            "module": "autoiac_steps.validation",
+            "function": "validate_template_syntax"
+          },
+          "inputs": {
+            "format": "ctx.format",
+            "template": "ctx.template"
+          },
+          "outputs": {
+            "validation_result": "ctx.validation_result"
+          },
+          "timeout": 10,
+          "on_failure": "abort"
+        }
+      ]
+    }
+  ]
+}

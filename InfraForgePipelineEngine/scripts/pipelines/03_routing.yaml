@@ -1,0 +1,31 @@
+# Tests routing: on_success=done (early exit), on_failure=next (continue on failure)
+name: routing-test
+context:
+  should_skip: false
+options:
+  timeout: 30
+stages:
+  - id: early_exit_stage
+    name: Early Exit Test
+    steps:
+      - id: do_work
+        type: noop
+        name: Do Work
+        config:
+          message: "Step that succeeds and routes to done"
+        on_success: done
+
+      - id: never_reached
+        type: noop
+        name: This Should Not Run
+        config:
+          message: "BUG — this step should have been skipped by done routing"
+
+  - id: continue_on_fail
+    name: Continue On Failure Test
+    steps:
+      - id: noop_pass
+        type: noop
+        name: A Passing Step
+        config:
+          message: "This step passes, stage should succeed"

@@ -1,0 +1,22 @@
+# Simplest possible pipeline — one noop step
+name: hello-world
+context:
+  greeting: "Hello from YAML!"
+options:
+  timeout: 30
+stages:
+  - id: greet
+    name: Greeting Stage
+    steps:
+      - id: say_hello
+        type: noop
+        name: Say Hello
+        config:
+          message: "Running hello-world pipeline"
+          outputs:
+            echo: "Pipeline engine works!"
+        inputs:
+          greeting: ctx.greeting
+        outputs:
+          echo: ctx.echo_result
+        timeout: 10

@@ -1,0 +1,331 @@
+{
+  "name": "service-onboarding",
+  "context": {
+    "service_id": "Microsoft.Network/virtualNetworks",
+    "region": "eastus2",
+    "subscription_id": "00000000-0000-0000-0000-000000000000",
+    "resource_group": "rg-infraforge-onboard-test"
+  },
+  "options": {
+    "timeout": 3600,
+    "dry_run": false
+  },
+  "stages": [
+    {
+      "id": "init",
+      "name": "Initialize",
+      "steps": [
+        {
+          "id": "initialize",
+          "type": "python",
+          "name": "Initialize Pipeline Context",
+          "config": {
+            "module": "infraforge_steps.init",
+            "function": "initialize_onboarding"
+          },
+          "outputs": {
+            "model_routing": "ctx.model_routing",
+            "service_meta": "ctx.service_meta"
+          },
+          "timeout": 30,
+          "on_failure": "abort"
+        },
+        {
+          "id": "check_deps",
+          "type": "python",
+          "name": "Check Dependency Gates",
+          "config": {
+            "module": "infraforge_steps.deps",
+            "function": "check_dependency_gates"
+          },
+          "inputs": {
+            "service_id": "ctx.service_id"
+          },
+          "outputs": {
+            "dependency_status": "ctx.dependency_status"
+          },
+          "timeout": 60,
+          "on_failure": "abort"
+        }
+      ]
+    },
+    {
+      "id": "analysis",
+      "name": "Standards & Architecture Analysis",
+      "steps": [
+        {
+          "id": "analyze_standards",
+          "type": "python",
+          "name": "Analyze Organization Standards",
+          "config": {
+            "module": "infraforge_steps.standards",
+            "function": "analyze_standards"
+          },
+          "inputs": {
+            "service_id": "ctx.service_id"
+          },
+          "outputs": {
+            "standards_context": "ctx.standards_context"
+          },
+          "timeout": 120,
+          "on_failure": "abort"
+        },
+        {
+          "id": "plan_architecture",
+          "type": "http",
+          "name": "Plan Architecture via LLM",
+          "config": {
+            "method": "POST",
+            "url": "{ctx.llm_endpoint}/chat/completions",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {ctx.llm_api_key}"
+            },
+            "body": {
+              "model": "gpt-4o",
+              "messages": [
+                {"role": "system", "content": "You are an Azure infrastructure architect."},
+                {"role": "user", "content": "Plan architecture for {ctx.service_id} following standards: {ctx.standards_context}"}
+              ]
+            },
+            "expected_status": 200,
+            "timeout": 120
+          },
+          "outputs": {
+            "body": "ctx.architecture_plan"
+          },
+          "timeout": 180,
+          "on_failure": "abort"
+        }
+      ]
+    },
+    {
+      "id": "generate",
+      "name": "Generate Templates",
+      "steps": [
+        {
+          "id": "generate_arm",
+          "type": "python",
+          "name": "Generate ARM Template",
+          "config": {
+            "module": "infraforge_steps.generators",
+            "function": "generate_arm_template"
+          },
+          "inputs": {
+            "service_id": "ctx.service_id",
+            "architecture_plan": "ctx.architecture_plan",
+            "standards_context": "ctx.standards_context"
+          },
+          "outputs": {
+            "template": "ctx.template",
+            "template_meta": "ctx.template_meta"
+          },
+          "timeout": 300,
+          "on_failure": "abort",
+          "healing": {
+            "enabled": true,
+            "max_attempts": 5,
+            "backoff": "exponential",
+            "base_delay": 2.0,
+            "healer_type": "python",
+            "healer_config": {
+              "module": "infraforge_steps.healing",
+              "function": "heal_arm_template"
+            }
+          }
+        },
+        {
+          "id": "generate_policy",
+          "type": "python",
+          "name": "Generate Azure Policy",
+          "config": {
+            "module": "infraforge_steps.generators",
+            "function": "generate_policy"
+          },
+          "inputs": {
+            "service_id": "ctx.service_id",
+            "template": "ctx.template"
+          },
+          "outputs": {
+            "policy": "ctx.policy"
+          },
+          "timeout": 300,
+          "on_failure": "abort",
+          "healing": {
+            "enabled": true,
+            "max_attempts": 3,
+            "backoff": "exponential",
+            "healer_type": "python",
+            "healer_config": {
+              "module": "infraforge_steps.healing",
+              "function": "heal_policy"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "governance",
+      "name": "Governance Review",
+      "steps": [
+        {
+          "id": "governance_review",
+          "type": "python",
+          "name": "CISO + CTO Governance Review",
+          "config": {
+            "module": "infraforge_steps.governance",
+            "function": "run_governance_review"
+          },
+          "inputs": {
+            "template": "ctx.template",
+            "policy": "ctx.policy",
+            "service_id": "ctx.service_id"
+          },
+          "outputs": {
+            "governance_verdict": "ctx.governance_verdict",
+            "template": "ctx.template"
+          },
+          "timeout": 600,
+          "on_failure": "abort",
+          "healing": {
+            "enabled": true,
+            "max_attempts": 5,
+            "backoff": "exponential",
+            "base_delay": 3.0,
+            "healer_type": "python",
+            "healer_config": {
+              "module": "infraforge_steps.healing",
+              "function": "heal_governance_rejection"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "validate_deploy",
+      "name": "Validate & Deploy",
+      "steps": [
+        {
+          "id": "validate_arm",
+          "type": "python",
+          "name": "Validate ARM Template (What-If + Deploy)",
+          "config": {
+            "module": "infraforge_steps.deploy",
+            "function": "validate_and_deploy"
+          },
+          "inputs": {
+            "template": "ctx.template",
+            "resource_group": "ctx.resource_group",
+            "region": "ctx.region"
+          },
+          "outputs": {
+            "deployment_id": "ctx.deployment_id",
+            "deployed_rg": "ctx.deployed_rg"
+          },
+          "timeout": 1800,
+          "on_failure": "abort",
+          "healing": {
+            "enabled": true,
+            "max_attempts": 5,
+            "backoff": "exponential",
+            "base_delay": 5.0,
+            "healer_type": "python",
+            "healer_config": {
+              "module": "infraforge_steps.healing",
+              "function": "heal_arm_template"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "testing",
+      "name": "Infrastructure Testing",
+      "steps": [
+        {
+          "id": "smoke_tests",
+          "type": "python",
+          "name": "Run Infrastructure Smoke Tests",
+          "config": {
+            "module": "infraforge_steps.testing",
+            "function": "run_smoke_tests"
+          },
+          "inputs": {
+            "deployment_id": "ctx.deployment_id",
+            "resource_group": "ctx.deployed_rg"
+          },
+          "outputs": {
+            "test_results": "ctx.test_results"
+          },
+          "timeout": 600,
+          "on_failure": "abort",
+          "healing": {
+            "enabled": true,
+            "max_attempts": 3,
+            "backoff": "linear",
+            "healer_type": "python",
+            "healer_config": {
+              "module": "infraforge_steps.healing",
+              "function": "heal_arm_template"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "finalize",
+      "name": "Deploy Policy & Finalize",
+      "steps": [
+        {
+          "id": "deploy_policy",
+          "type": "python",
+          "name": "Deploy Azure Policy",
+          "config": {
+            "module": "infraforge_steps.deploy",
+            "function": "deploy_policy"
+          },
+          "inputs": {
+            "policy": "ctx.policy"
+          },
+          "timeout": 300,
+          "on_failure": "abort"
+        },
+        {
+          "id": "cleanup",
+          "type": "python",
+          "name": "Cleanup Test Resources",
+          "config": {
+            "module": "infraforge_steps.deploy",
+            "function": "cleanup_test_resources"
+          },
+          "inputs": {
+            "deployed_rg": "ctx.deployed_rg"
+          },
+          "timeout": 300,
+          "on_failure": "next"
+        },
+        {
+          "id": "promote",
+          "type": "python",
+          "name": "Promote Service to v1.0.0",
+          "config": {
+            "module": "infraforge_steps.catalog",
+            "function": "promote_service"
+          },
+          "inputs": {
+            "service_id": "ctx.service_id",
+            "template": "ctx.template",
+            "policy": "ctx.policy",
+            "test_results": "ctx.test_results"
+          },
+          "outputs": {
+            "version": "ctx.version",
+            "service_status": "ctx.service_status"
+          },
+          "timeout": 60,
+          "on_failure": "abort"
+        }
+      ]
+    }
+  ]
+}

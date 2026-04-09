@@ -1,0 +1,67 @@
+# Simple pipeline with a single human approval gate
+# Good for testing pause/resume without the complexity of a full process
+
+name: simple-approval
+context:
+  change_description: "Add NSG rules for port 443 inbound"
+  change_owner: "aharsan"
+options:
+  timeout: 86400  # 24h
+stages:
+  - id: prepare
+    name: Prepare Change
+    steps:
+      - id: describe_change
+        type: noop
+        name: Describe Change
+        config:
+          message: "Preparing change request: {ctx.change_description}"
+          outputs:
+            change_id: "CHG-2026-0409"
+        outputs:
+          change_id: ctx.change_id
+
+  - id: approval
+    name: Manager Approval
+    steps:
+      - id: manager_approval
+        type: gate
+        name: Manager Approval
+        config:
+          gate_type: approval
+          assignee: team-lead
+          instructions: |
+            Change request needs your approval:
+            - Change: {ctx.change_description}
+            - Owner: {ctx.change_owner}
+            - ID: Will be assigned upon approval
+          required_inputs:
+            - name: approved
+              type: boolean
+              required: true
+              description: "Do you approve this change?"
+            - name: comments
+              type: text
+              required: false
+              description: "Optional comments"
+        inputs:
+          change_description: ctx.change_description
+          change_owner: ctx.change_owner
+          change_id: ctx.change_id
+        outputs:
+          approved: ctx.approved
+          comments: ctx.approval_comments
+
+  - id: execute
+    name: Execute Change
+    condition: "ctx.approved"
+    steps:
+      - id: apply
+        type: noop
+        name: Apply Change
+        config:
+          message: "Applying change {ctx.change_id}: {ctx.change_description}"
+          outputs:
+            result: "Change applied successfully"
+        outputs:
+          result: ctx.result

@@ -1,0 +1,28 @@
+# Tests dry_run mode — steps report what they'd do without executing
+name: dry-run-test
+context:
+  service_id: "Microsoft.Network/virtualNetworks"
+  region: "eastus2"
+options:
+  timeout: 30
+  dry_run: true
+stages:
+  - id: deploy
+    name: Dry Run Deploy
+    steps:
+      - id: run_python
+        type: python
+        name: Python Step (dry run)
+        config:
+          module: json
+          function: dumps
+          kwargs:
+            obj: {"test": true}
+        timeout: 10
+
+      - id: run_shell
+        type: shell
+        name: Shell Step (dry run)
+        config:
+          command: "echo This should not actually run"
+        timeout: 10
